@@ -1,10 +1,13 @@
+<p align="center">
+  <img src="gui/assets/icon-256.png" width="128" alt="Rsyncronizer app icon">
+</p>
+
 # Rsyncronizer
 
-<a href="https://buymeacoffee.com/yilmazdoga"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="40"></a>
-
-Append-only rsync backups over SSH: engine, desktop apps and CLI. Clone this
-repo onto each machine you back up **from**. Destinations need nothing
-installed beyond SSH and rsync.
+Append-only rsync backups over SSH: engine, desktop apps and CLI. Install it
+on each machine you back up **from** (see *Install* below), or clone this
+repo and run it in place. Destinations need nothing installed beyond SSH and
+rsync.
 
 ```
 laptop (macOS)  ──►  backup-server (Linux)  ──►  nas (Synology)
@@ -16,7 +19,78 @@ a file at the source and it stays at the destination until you delete it there
 yourself, or until you explicitly ask for `--sync-deletions` run (see *Deleting at the destination* below). This is enforced
 at runtime, not just by convention; see *Safety*.
 
+## Install
+
+Every build is on the
+[Releases page](https://github.com/yilmazdoga/rsyncronizer/releases/latest):
+a desktop app for macOS and Linux, and a headless CLI for any machine with
+bash. All forms need `rsync` and `ssh` on the machine; macOS ships both, on
+Linux run `sudo apt install rsync openssh-client`.
+
+### Desktop app on macOS (Apple silicon)
+
+Download `rsyncronizer-<version>-macos-arm64.zip` from Releases, unzip it and
+drag `Rsyncronizer.app` into `/Applications`. The first launch of a
+downloaded copy is blocked because the app is unsigned: double-click it once,
+then System Settings → Privacy and Security → **Open Anyway**. Terminal
+alternative:
+
+```bash
+xattr -dr com.apple.quarantine /Applications/Rsyncronizer.app
+```
+
+That is needed one time only. Afterwards the app updates itself: it checks
+on startup and shows an **Update Available** button when a new release is
+out.
+
+### Desktop app on Linux (x86_64)
+
+Needs glibc 2.35 or newer (Ubuntu 22.04+) and a desktop session. This
+installs per-user, no root needed, and puts Rsyncronizer in your app menu:
+
+```bash
+ver=$(curl -fsSL https://api.github.com/repos/yilmazdoga/rsyncronizer/releases/latest | sed -n 's/.*"tag_name": *"v//p' | sed 's/".*//')
+curl -fsSLO "https://github.com/yilmazdoga/rsyncronizer/releases/download/v${ver}/rsyncronizer-${ver}-linux-x86_64.tar.gz"
+tar -xzf "rsyncronizer-${ver}-linux-x86_64.tar.gz"
+"./rsyncronizer-${ver}-linux-x86_64/install.sh"
+```
+
+Prefer not to install? Extract and run it in place:
+`./rsyncronizer-<version>-linux-x86_64/rsyncronizer/rsyncronizer`.
+
+### CLI on macOS or Linux (no GUI)
+
+One tarball works on both systems; it is plain bash. This installs the
+engine to `~/.local/share/rsync-backup-scripts/` and the `rsyncronizer`
+command to `~/.local/bin/` (make sure that is on your `PATH`):
+
+```bash
+ver=$(curl -fsSL https://api.github.com/repos/yilmazdoga/rsyncronizer/releases/latest | sed -n 's/.*"tag_name": *"v//p' | sed 's/".*//')
+curl -fsSLO "https://github.com/yilmazdoga/rsyncronizer/releases/download/v${ver}/rsyncronizer-cli-${ver}.tar.gz"
+tar -xzf "rsyncronizer-cli-${ver}.tar.gz"
+"./rsyncronizer-cli-${ver}/install-cli.sh"
+```
+
+Start with `rsyncronizer help`; update later with `rsyncronizer update`.
+
+### From source
+
+```bash
+git clone https://github.com/yilmazdoga/rsyncronizer.git
+cd rsyncronizer
+```
+
+The engine runs straight from the clone (`./setup.sh`, `./status.sh`). For
+the CLI command, run `cli/install-cli.sh`; for the desktop app, see
+[gui/README.md](gui/README.md).
+
+The app and the CLI share one engine home, so on a machine that runs the GUI
+app, update through the app; it refreshes the shared engine on launch.
+
 ## Setup
+
+From a clone, run the wizard below; from an install, the same wizard is the
+app's **New backup** button or `rsyncronizer new`.
 
 ```bash
 ./setup.sh
@@ -157,9 +231,8 @@ the remote declines; deletions only ever run after a completed transfer.
 
 ## The CLI (no GUI needed)
 
-`rsyncronizer` is the same engine with a terminal face. Grab
-`rsyncronizer-cli-<ver>.tar.gz` from Releases (or run `cli/install-cli.sh`
-from a clone):
+`rsyncronizer` is the same engine with a terminal face (installation is
+covered under *Install* above):
 
 ```bash
 rsyncronizer status
@@ -198,11 +271,8 @@ that name. Cron blocks are keyed by backup name, so the wizard *replaces* the
 clone's cron entry. Do **not** also run the old clone's cron removal
 afterwards, or you would strip the entry the app just installed.
 
-macOS first launch of a **downloaded** copy: the app is unsigned, so the
-first open is blocked. Double-click once, then System Settings → Privacy &
-Security → **Open Anyway** (macOS 15+ removed the right-click→Open shortcut
-for unsigned apps). One time only; a locally built copy is not quarantined
-and just opens.
+Installation and the one-time macOS first-launch step are covered under
+*Install* above. A locally built copy is not quarantined and just opens.
 
 ## Layout
 
@@ -304,17 +374,15 @@ source propagates rather than being versioned.
 
 Rsyncronizer is completely free and will be so forever. If you find it useful,
 please consider supporting me and my work:
-[buymeacoffee.com/yilmazdoga](https://buymeacoffee.com/yilmazdoga).
+
+<a href="https://buymeacoffee.com/yilmazdoga"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="40"></a>
 
 The apps remind you gently: once every 10 completed backups, the desktop app
 shows a small dialog and an interactive terminal run prints a note with a QR
 code. If you have already supported, or simply do not want to, type
 `i have supported` in the dialog (or run `rsyncronizer support --done`) and
 the reminder never appears again; click Later and it returns after 10 more
-backups. It is an honor system; nothing is verified. Dry runs never count,
-scheduled runs are never interrupted, and the whole feature is one local
-gitignored file (`config/support.txt`). Nothing is transmitted and there is
-no telemetry.
+backups.
 
 ## Notes
 
