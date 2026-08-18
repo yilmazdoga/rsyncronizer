@@ -377,12 +377,9 @@ please consider supporting me and my work:
 
 <a href="https://buymeacoffee.com/yilmazdoga"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="40"></a>
 
-The apps remind you gently: once every 10 completed backups, the desktop app
-shows a small dialog and an interactive terminal run prints a note with a QR
-code. If you have already supported, or simply do not want to, type
-`i have supported` in the dialog (or run `rsyncronizer support --done`) and
-the reminder never appears again; click Later and it returns after 10 more
-backups.
+Every 10 completed backups, the app displays a support reminder. The desktop app shows a small dialog, and the terminal prints a note with a QR code.
+
+If you have already supported (thank you!), or simply do not want to, type `i have supported` in the dialog (or run `rsyncronizer support --done`) to permanently disable it. Clicking Later postpones the reminder for 10 more backups.
 
 ## Notes
 
