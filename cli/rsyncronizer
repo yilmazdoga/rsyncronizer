@@ -1,0 +1,284 @@
+#!/bin/bash
+#
+# rsyncronizer -- the terminal face of the engine. Every subcommand drives the
+# same scripts the GUI uses; nothing here contains backup logic.
+#
+# Works from a repo clone AND from the installed engine home; the anchor below
+# resolves the ~/.local/bin/rsyncronizer symlink to the real file first
+# (dirname of a SYMLINK is the symlink's directory, which is not the engine).
+
+set -uo pipefail
+
+_src=${BASH_SOURCE[0]:-$0}
+while [ -h "$_src" ]; do
+    _dir=$(cd -P "$(dirname -- "$_src")" && pwd)
+    _src=$(readlink -- "$_src")
+    case $_src in
+        /*) ;;
+        *) _src=$_dir/$_src ;;
+    esac
+done
+CLI_DIR=$(cd -P "$(dirname -- "$_src")" && pwd)
+ROOT=$(cd -P "$CLI_DIR/.." && pwd)
+
+# tput-guarded colors: plain when piped or colorless.
+if [ -t 1 ] && command -v tput >/dev/null 2>&1 \
+   && [ "$(tput colors 2>/dev/null || echo 0)" -ge 8 ]; then
+    B=$(tput bold); G=$(tput setaf 2); C=$(tput setaf 6); R=$(tput setaf 1); N=$(tput sgr0)
+else
+    B=''; G=''; C=''; R=''; N=''
+fi
+
+die() { printf '%serror:%s %s\n' "$R" "$N" "$1" >&2; exit "${2:-64}"; }
+say() { printf '%s\n' "$*"; }
+
+valid_name() {
+    case $1 in
+        ""|*[!A-Za-z0-9._-]*) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+need_runner() {
+    valid_name "$1" || die "invalid backup name: $1" 78
+    [ -x "$ROOT/backups/$1.sh" ] \
+        || die "no backup named '$1' here -- 'rsyncronizer status' lists them" 78
+}
+
+usage() {
+    cat <<EOF
+${B}Rsyncronizer${N} $(cat "$ROOT/VERSION" 2>/dev/null || echo '?') -- append-only rsync backups
+
+${B}usage:${N} rsyncronizer <command> [args]
+
+  ${G}status${N}                       health of every backup on this machine
+  ${G}new${N}                          create or edit a backup (interactive wizard)
+  ${G}run${N} <name>                   run a backup now
+  ${G}dry${N} <name>                   dry run -- transfers nothing
+  ${R}sync-deletions${N} <name>        preview + typed confirmation + delete
+  ${G}remove${N} <name>                delete a backup schedule (data untouched)
+  ${G}ignore${N} [<name>|--list]       edit the global (or per-backup) ignore rules
+  ${C}remote${N} list                  remote servers
+  ${C}remote${N} add <label> <host> <path>
+  ${C}remote${N} rm <label>
+  ${C}remote${N} <label> status
+  ${C}remote${N} <label> run|dry|sync-deletions <name>
+  ${G}ssh-setup${N} [user@]host        set up key-based auth (password asked once)
+  ${G}update${N}                       update this install from GitHub Releases
+  ${G}support${N} [--done]             buy the author a coffee / say you already did
+  ${G}version${N} | ${G}help${N}
+EOF
+}
+
+GLOBAL_IGNORE=$ROOT/config/global-exclude.txt
+
+cmd=${1:-help}
+[ $# -gt 0 ] && shift
+
+case $cmd in
+    status)
+        exec "$ROOT/status.sh" "$@"
+        ;;
+    new)
+        exec "$ROOT/setup.sh"
+        ;;
+    run)
+        need_runner "${1:-}"
+        exec "$ROOT/backups/$1.sh"
+        ;;
+    dry)
+        need_runner "${1:-}"
+        exec "$ROOT/backups/$1.sh" --dry-run
+        ;;
+    sync-deletions)
+        need_runner "${1:-}"
+        exec "$ROOT/backups/$1.sh" --sync-deletions
+        ;;
+    remove)
+        valid_name "${1:-}" || die "usage: rsyncronizer remove <name>"
+        exec "$ROOT/setup.sh" --remove "$1"
+        ;;
+    ignore)
+        case ${1:-} in
+            --list)
+                printf '%sExclude stack%s (first match wins, top to bottom):\n' "$B" "$N"
+                if [ -f "$GLOBAL_IGNORE" ]; then
+                    printf '  1. %s  (global -- the complete list, yours)\n' "$GLOBAL_IGNORE"
+                else
+                    printf '  1. %s  (shipped defaults; becomes your editable global file on first edit)\n' "$ROOT/rsync-ignore.txt"
+                fi
+                printf '  2. config/<name>/exclude.txt  (per backup, where present):\n'
+                for _d in "$ROOT"/config/*/; do
+                    [ -f "$_d/exclude.txt" ] && printf '       %s\n' "$_d/exclude.txt"
+                done
+                exit 0
+                ;;
+            "")
+                _file=$GLOBAL_IGNORE
+                if [ ! -f "$_file" ]; then
+                    mkdir -p "$ROOT/config"
+                    {
+                        echo "# Global excludes -- applied to EVERY backup on this machine."
+                        echo "# This file IS the complete global list (seeded from the shipped"
+                        echo "# defaults; once it exists, rsync-ignore.txt no longer applies)."
+                        echo "# One rule per line, '- ' prefix, bare basenames. Deleting a line"
+                        echo "# un-excludes it. Excluded names are also protected from"
+                        echo "# sync-deletions at the destination."
+                        grep -v '^#' "$ROOT/rsync-ignore.txt" | grep -v '^[[:space:]]*$'
+                    } >"$_file"
+                fi
+                ;;
+            *)
+                valid_name "$1" || die "invalid backup name: $1" 78
+                [ -d "$ROOT/config/$1" ] || die "no backup named '$1'" 78
+                _file=$ROOT/config/$1/exclude.txt
+                if [ ! -f "$_file" ]; then
+                    {
+                        echo "# Extra excludes for THIS backup only, on top of the global layers."
+                        echo "# One rule per line, '- ' prefix, bare basenames."
+                    } >"$_file"
+                fi
+                ;;
+        esac
+        exec "${EDITOR:-vi}" "$_file"
+        ;;
+    remote)
+        # `remote <label> status` gets a human rendering (the raw porcelain
+        # stays available via remote.sh directly); everything else passes
+        # through untouched.
+        if [ $# -ge 2 ] && [ "$2" = status ]; then
+            _out=$("$ROOT/remote.sh" "$1" status)
+            _rc=$?
+            [ "$_rc" = 0 ] || exit "$_rc"
+            _rhost=$(sed -n 's/^HOST=//p' "$ROOT/remotes/$1.txt" 2>/dev/null | tail -1)
+            printf '%s' "$_out" | awk -F= -v host="${_rhost##*@}" -v b="$B" -v g="$G" -v c="$C" -v r="$R" -v n="$N" '
+                function flush() {
+                    if (name == "") return
+                    colour = (rc == "0" || rc == "24") ? g : r
+                    if (never == "1") { verdict = "NEVER RAN"; colour = n }
+                    sched = s
+                    if (t == "1" || (dt == "local" && s ~ /^\*\//)) sched = "on drive connect"
+                    if (sched == "") sched = "manual runs only"
+                    printf "  %s%-28s%s %s%-10s%s  last run: %-19s  %s\n", \
+                           c, name, n, colour, verdict, n, (w == "" ? "never" : w), sched
+                    name = ""; never = ""; t = ""; dt = ""; s = ""; w = ""
+                }
+                /^HOSTNAME=/ { hn = $2; sub(/\..*/, "", hn) }
+                /^BACKUP=/   { flush(); name = $2 }
+                /^VERDICT=/  { verdict = $2; sub(/ --.*/, "", verdict); sub(/ \(.*/, "", verdict) }
+                /^RC=/       { rc = $2 }
+                /^NEVER_RAN=/{ never = $2 }
+                /^SCHEDULE=/ { s = $2 }
+                /^TRIGGER=/  { t = $2 }
+                /^DEST_TYPE=/{ dt = $2 }
+                /^LAST_WHEN=/{ w = $2 }
+                END {
+                    flush()
+                }
+                NR == 1 {
+                    # header printed once, before any backup block
+                }' | {
+                    # Title line: the MACHINE name leads; the registration in
+                    # parentheses when they differ (IP registrations etc.).
+                    _hn=$(printf '%s' "$_out" | sed -n 's/^HOSTNAME=//p' | head -1 | sed 's/\..*//')
+                    _bare=${_rhost##*@}
+                    if [ -n "$_hn" ] && [ "$_hn" != "$_bare" ]; then
+                        printf '%sREMOTE: %s%s  (%s)\n' "$B" "$_hn" "$N" "$_bare"
+                    else
+                        printf '%sREMOTE: %s%s\n' "$B" "${_hn:-$_bare}" "$N"
+                    fi
+                    cat
+                }
+            exit 0
+        fi
+        exec "$ROOT/remote.sh" "$@"
+        ;;
+    update)
+        # Self-update for CLI-only installs. On a machine that runs the GUI
+        # app, update the APP instead: it refreshes this engine on launch and
+        # would revert a CLI-side update.
+        if [ -d "$ROOT/.git" ]; then
+            die "this is a git clone -- update it with: git pull" 78
+        fi
+        command -v curl >/dev/null 2>&1 || die "curl is required for update" 69
+        _api=${RBS_UPDATE_API_URL:-https://api.github.com/repos/yilmazdoga/rsyncronizer/releases/latest}
+        _json=$(curl -fsSL --max-time 10 "$_api") || die "cannot reach GitHub" 69
+        _tag=$(printf '%s' "$_json" | grep -m1 '"tag_name"' | sed 's/.*"tag_name"[^"]*"//; s/".*//')
+        _latest=${_tag#v}
+        [ -n "$_latest" ] || die "no published release found" 69
+        _cur=$(cat "$ROOT/VERSION")
+        if ! awk -v a="$_latest" -v b="$_cur" 'BEGIN {
+                split(a, x, "."); split(b, y, ".")
+                for (i = 1; i <= 3; i++) {
+                    if (x[i] + 0 > y[i] + 0) exit 0
+                    if (x[i] + 0 < y[i] + 0) exit 1
+                }
+                exit 1
+            }'; then
+            say "already up to date ($_cur)"
+            exit 0
+        fi
+        # BSD sed has no \| alternation: strip the key prefix and the closing
+        # quote in two plain substitutions instead.
+        _url=$(printf '%s' "$_json" \
+               | grep -o '"browser_download_url"[^"]*"[^"]*rsyncronizer-cli-[^"]*"' \
+               | head -1 | sed 's/.*"browser_download_url"[^"]*"//; s/"$//')
+        [ -n "$_url" ] || die "release $_latest has no CLI tarball" 69
+        say "updating $_cur -> $_latest ..."
+        _tmp=$(mktemp -d)
+        curl -fsSL --max-time 300 -o "$_tmp/cli.tar.gz" "$_url" || die "download failed" 69
+        tar -xzf "$_tmp/cli.tar.gz" -C "$_tmp" || die "bad tarball" 69
+        _inst=$(find "$_tmp" -name install-cli.sh | head -1)
+        [ -n "$_inst" ] || die "the tarball has no install-cli.sh" 69
+        chmod +x "$_inst"
+        "$_inst" || die "install failed" 69
+        rm -rf "$_tmp"
+        say "updated to $_latest (user state untouched)"
+        ;;
+    support)
+        # Validate BEFORE sourcing: common.sh replaces this script's die()
+        # with its own code-first variant.
+        case ${1:-} in
+            ''|--done) ;;
+            *) die "usage: rsyncronizer support [--done]" ;;
+        esac
+        _mode=${1:-}
+        REPO_ROOT=$ROOT
+        . "$ROOT/lib/common.sh"
+        if [ "$_mode" = --done ]; then
+            # Honor system, permanent. Counters are preserved.
+            _support_write yes "$(_support_num RUN_COUNT 0)" \
+                "$(_support_num LAST_NAG_COUNT 0)"
+            say "Thank you for supporting Rsyncronizer!"
+            say "The reminder will not appear again on this machine."
+        elif _support_supported; then
+            say "You have already marked yourself as a supporter. Thank you!"
+            say "The page stays open to everyone: $SUPPORT_URL"
+        else
+            say ""
+            say "Rsyncronizer has completed $(_support_num RUN_COUNT 0) backups on this machine."
+            say "It is completely free and will be so forever. If you find it"
+            say "useful, please consider supporting me and my work:"
+            say ""
+            say "    $SUPPORT_URL"
+            say ""
+            grep -v '^#' "$ROOT/lib/support-qr.txt" 2>/dev/null
+            say ""
+            say "Already supported? Run: rsyncronizer support --done"
+        fi
+        ;;
+    ssh-setup)
+        [ $# -ge 1 ] || die "usage: rsyncronizer ssh-setup [user@]host"
+        exec "$ROOT/ssh-setup.sh" "$1"
+        ;;
+    version)
+        cat "$ROOT/VERSION"
+        ;;
+    help|-h|--help)
+        usage
+        ;;
+    *)
+        usage >&2
+        die "unknown command: $cmd"
+        ;;
+esac

@@ -1,0 +1,21 @@
+# The engine file set -- the SINGLE source of truth, consumed by:
+#   gui/app/engine.py      (runtime materialization into the app data dir)
+#   gui/rsyncronizer.spec  (build-time bundling)
+#   cli/install-cli.sh     (no-GUI installs)
+#   tests/run-tests.sh     (consistency check)
+# One path per line; blanks and # comments ignored. The manifest ships itself
+# so an installed engine home can in turn be an install source.
+setup.sh
+status.sh
+remote.sh
+ssh-setup.sh
+rsync-ignore.txt
+VERSION
+lib/common.sh
+lib/trigger-macos.sh
+lib/trigger-linux.sh
+lib/wait-for-mount.sh
+lib/support-qr.txt
+lib/engine-manifest.txt
+tests/cron-smoke-test.sh
+cli/rsyncronizer

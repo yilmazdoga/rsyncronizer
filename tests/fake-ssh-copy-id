@@ -1,0 +1,6 @@
+#!/bin/bash
+# Stand-in for ssh-copy-id: records argv, succeeds unless told otherwise.
+: "${FAKE_SCI_ARGV:=/tmp/fake-sci-argv.txt}"
+: >"$FAKE_SCI_ARGV"
+for a in "$@"; do printf '%s\n' "$a" >>"$FAKE_SCI_ARGV"; done
+exit "${FAKE_SCI_EXIT:-0}"

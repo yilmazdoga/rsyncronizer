@@ -1,0 +1,24 @@
+# https://buymeacoffee.com/yilmazdoga
+# UTF-8 half-block QR for the support reminder. Comment lines are stripped at
+# display time (grep -v "^#"). Regenerate if the URL ever changes:
+#   python3 -m venv /tmp/qrv && /tmp/qrv/bin/pip -q install qrcode && \
+#   /tmp/qrv/bin/python -c "import qrcode,sys; q=qrcode.QRCode(border=2); \
+#     q.add_data('https://buymeacoffee.com/yilmazdoga'); q.make(); \
+#     q.print_ascii(out=sys.stdout, invert=True)"
+█████████████████████████████████
+██ ▄▄▄▄▄ █▀ ▀▄ ▀▄██▄  ▀█ ▄▄▄▄▄ ██
+██ █   █ ██▀█▄█▀█▄██▀ ▄█ █   █ ██
+██ █▄▄▄█ █▄█▄ █▄▀▀    ██ █▄▄▄█ ██
+██▄▄▄▄▄▄▄█▄▀▄▀ █▄▀▄▀ █ █▄▄▄▄▄▄▄██
+██▄▀ ▀▄▀▄▀██  ▀▀██ ▄▄▄▄▀▀█▄▀█▄▀██
+██▀ ▄ ▄█▄ ▄  █ ▀ █▀ ▀▀▀▄▄▄ █▄ ▄██
+██  ▄▀▀ ▄█ ▀ ▀▄█ █ ▄▀█   ██ █▄ ██
+██▀ ▀▀ ▀▄▄▀▄▄█▄▄██▀▀ ▀▀█▄   █ ▄██
+██▄▀█ █ ▄ █▄ ▀ ▀█▄ ▄██   ▄█ ▀▄ ██
+██▄▀  ▄ ▄█▄█▄  ▀ ▀ ▀ █ █ ▄▄▀█ ▄██
+██▄██▄▄█▄█▀ ▀▄ █ █ ▄█▀ ▄▄▄ █▀▀▀██
+██ ▄▄▄▄▄ ██▄▀▀▀▄██▄▀█▄ █▄█  █▄ ██
+██ █   █ █▄▄▀▄▀▀█▄▀▄█▀ ▄▄▄ █▀▀ ██
+██ █▄▄▄█ █▄█ ██ █▀█▀▀  █▀  ▄█▀▄██
+██▄▄▄▄▄▄▄█▄███▄▄▄█▄▄█▄▄▄██▄██▄▄██
+▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀

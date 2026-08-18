@@ -1,0 +1,45 @@
+# rsync_backup_scripts
+#
+# This file replaced a 429-line Visual Studio template that inverted BOTH
+# halves of this repo's commit policy:
+#
+#   * `Backup*/` matched `backups/` on any case-insensitive filesystem
+#     (macOS APFS, git core.ignorecase=true), so the generated runners -- which
+#     MUST be committed -- were invisible to `git add` on the MacBook while
+#     being perfectly visible on the case-sensitive Ubuntu box. The same repo
+#     tracked a different set of files on the two machines.
+#   * `config/` was NOT ignored, so paths, usernames, hostnames and Tailscale
+#     IPs would have been committed.
+#
+# Do not paste a language/IDE template back in here without re-checking:
+#     git check-ignore -v backups/<name>.sh config/<name>/source.txt
+
+# Machine-specific configuration. Never commit: paths, usernames, hosts, IPs.
+config/*
+backups/*
+
+# Per-run logs and run state. Never commit.
+/logs/
+
+# Remote-server definitions: hosts and paths. Machine-specific, never commit.
+/remotes/
+
+# backups/ is ignored too. The generated runners contain nothing
+# machine-specific -- a backup name plus a call into lib/common.sh -- but they
+# are useless without their config/<name>/, which is ignored, so a committed
+# runner on another machine only fails with "no configuration, run setup.sh".
+# setup.sh regenerates them per machine, so there is nothing to preserve.
+
+.DS_Store
+._*
+*~
+*.swp
+
+CLAUDE.md
+
+# GUI build artifacts (anchored on purpose -- see the template warning above).
+/gui/build/
+/gui/dist/
+/gui/.venv/
+__pycache__/
+*.pyc

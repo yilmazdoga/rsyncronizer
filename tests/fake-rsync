@@ -1,0 +1,59 @@
+#!/bin/bash
+# Stand-in for rsync. Records the exact argv it was called with, emits a
+# plausible --stats block, and exits with $FAKE_RSYNC_EXIT (default 0).
+# Moves no data.
+#
+# $FAKE_RSYNC_ARGV holds the LAST call only (existing assertions rely on
+# that); $FAKE_RSYNC_ARGV.all accumulates every call behind a '=== call'
+# separator so multi-invocation flows (prune: preview, recheck, real) can be
+# inspected call by call.
+
+: "${FAKE_RSYNC_ARGV:=/tmp/fake-rsync-argv.txt}"
+: "${FAKE_RSYNC_EXIT:=0}"
+: "${FAKE_RSYNC_FILES:=42}"
+: "${FAKE_RSYNC_DELETIONS:=}"
+
+: >"$FAKE_RSYNC_ARGV"
+echo '=== call' >>"$FAKE_RSYNC_ARGV.all"
+for a in "$@"; do
+    printf '%s\n' "$a" >>"$FAKE_RSYNC_ARGV"
+    printf '%s\n' "$a" >>"$FAKE_RSYNC_ARGV.all"
+done
+
+# Deletion lines are emitted only when a --delete flag was actually passed,
+# mirroring rsync. FAKE_RSYNC_DELETIONS=N emits exactly N '*deleting' lines,
+# the first with a space in the name so list parsing is exercised on it.
+# FAKE_RSYNC_DELETIONS_FILE holds one count per line and each call CONSUMES
+# the first line -- that is how a test makes the preview and the recheck
+# disagree (the changed-list abort).
+_del=$FAKE_RSYNC_DELETIONS
+if [ -n "${FAKE_RSYNC_DELETIONS_FILE:-}" ] && [ -s "$FAKE_RSYNC_DELETIONS_FILE" ]; then
+    _del=$(head -1 "$FAKE_RSYNC_DELETIONS_FILE")
+    tail -n +2 "$FAKE_RSYNC_DELETIONS_FILE" >"$FAKE_RSYNC_DELETIONS_FILE.tmp"
+    mv "$FAKE_RSYNC_DELETIONS_FILE.tmp" "$FAKE_RSYNC_DELETIONS_FILE"
+fi
+_has_delete=0
+for a in "$@"; do
+    [ "$a" = --delete-after ] && _has_delete=1
+done
+if [ "$_has_delete" = 1 ] && [ -n "$_del" ] && [ "$_del" -gt 0 ] 2>/dev/null; then
+    echo "*deleting stale dir/"
+    i=1
+    while [ "$i" -lt "$_del" ]; do
+        echo "*deleting extra_$i.txt"
+        i=$((i + 1))
+    done
+fi
+
+echo "fake-rsync: pretending to transfer"
+# FAKE_RSYNC_GNU_STATS=1 mimics GNU rsync's comma-and-parenthetical format;
+# the default is openrsync's plain number.
+if [ -n "${FAKE_RSYNC_GNU_STATS:-}" ]; then
+    echo "Number of files: 1,416 (reg: 1,000, dir: 416)"
+else
+    echo "Number of files: 100"
+fi
+echo "Number of regular files transferred: $FAKE_RSYNC_FILES"
+echo "Total file size: 12345 bytes"
+
+exit "$FAKE_RSYNC_EXIT"

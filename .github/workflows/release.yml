@@ -1,0 +1,167 @@
+# Release: push a tag v<x.y.z> and this builds both apps and DRAFTS a GitHub
+# Release with the CHANGELOG section as its body. Publishing the draft is a
+# human decision, made in the Releases web UI after checking the artifacts.
+#
+# The tag must equal v$(cat VERSION) -- releasing without bumping VERSION (or
+# vice versa) fails fast in the guard job.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  guard:
+    name: tag-matches-VERSION
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          want="v$(cat VERSION)"
+          [ "$want" = "$GITHUB_REF_NAME" ] \
+            || { echo "tag $GITHUB_REF_NAME does not match VERSION ($want)"; exit 1; }
+
+  build-macos:
+    name: build-macos
+    needs: guard
+    runs-on: macos-latest    # Apple Silicon; the app is arm64-only
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r gui/requirements.txt
+      - name: build
+        working-directory: gui
+        run: pyinstaller --noconfirm rsyncronizer.spec
+      - name: smoke (frozen binary, no display)
+        run: |
+          RSYNC_BACKUP_GUI_HOME="$RUNNER_TEMP/engine-home" \
+            ./gui/dist/rsyncronizer/rsyncronizer --self-check
+      - name: package
+        run: |
+          ver=$(cat VERSION)
+          ditto -c -k --keepParent gui/dist/Rsyncronizer.app \
+            "rsyncronizer-${ver}-macos-arm64.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-app
+          path: rsyncronizer-*-macos-arm64.zip
+          if-no-files-found: error
+
+  build-linux:
+    name: build-linux
+    # ubuntu-22.04 pins the glibc floor: a PyInstaller binary runs only on
+    # glibc >= the build machine's. If GitHub retires this label, switch to
+    # runs-on: ubuntu-latest with `container: ubuntu:22.04` (and apt-install
+    # python3 inside it).
+    needs: guard
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Qt runtime deps (PyInstaller imports PySide6 during analysis)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libegl1 libxkbcommon0
+      - run: pip install -r gui/requirements.txt
+      - name: build
+        working-directory: gui
+        run: pyinstaller --noconfirm rsyncronizer.spec
+      - name: smoke (frozen binary, no display)
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          RSYNC_BACKUP_GUI_HOME="$RUNNER_TEMP/engine-home" \
+            ./gui/dist/rsyncronizer/rsyncronizer --self-check
+      - name: package
+        run: |
+          ver=$(cat VERSION)
+          stage="rsyncronizer-${ver}-linux-x86_64"
+          mkdir -p "$stage"
+          cp -R gui/dist/rsyncronizer "$stage/rsyncronizer"
+          cp gui/linux/install.sh gui/linux/rsyncronizer.desktop gui/linux/README.txt "$stage/"
+          chmod +x "$stage/install.sh"
+          tar -czf "${stage}.tar.gz" "$stage"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-app
+          path: rsyncronizer-*-linux-x86_64.tar.gz
+          if-no-files-found: error
+
+  build-cli:
+    name: build-cli
+    needs: guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: package (engine + CLI, no GUI)
+        run: |
+          ver=$(cat VERSION)
+          stage="rsyncronizer-cli-${ver}"
+          mkdir -p "$stage"
+          while IFS= read -r f; do
+            case $f in ''|'#'*) continue ;; esac
+            mkdir -p "$stage/$(dirname "$f")"
+            cp "$f" "$stage/$f"
+          done < lib/engine-manifest.txt
+          cp cli/install-cli.sh "$stage/install-cli.sh"
+          chmod 755 "$stage"/*.sh "$stage/cli/rsyncronizer" "$stage/install-cli.sh"
+          tar -czf "${stage}.tar.gz" "$stage"
+      - name: smoke (install + status on the runner)
+        run: |
+          ver=$(cat VERSION)
+          tar -xzf "rsyncronizer-cli-${ver}.tar.gz"
+          "rsyncronizer-cli-${ver}/install-cli.sh"
+          "$HOME/.local/bin/rsyncronizer" version
+          "$HOME/.local/bin/rsyncronizer" status
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cli
+          path: rsyncronizer-cli-*.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: draft-release
+    # All three artifacts: forgetting one here OR in files: below silently
+    # drops it from the draft (fail_on_unmatched_files guards only listed globs).
+    needs: [build-macos, build-linux, build-cli]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - name: extract this version's CHANGELOG section
+        run: |
+          ver=$(cat VERSION)
+          awk -v ver="$ver" '
+              $0 ~ "^## \\[" ver "\\]" { found = 1; next }
+              /^## \[/ && found { exit }
+              found { print }
+          ' CHANGELOG.md > release-notes.md
+          [ -s release-notes.md ] || { echo "CHANGELOG.md has no ## [$ver] section"; exit 1; }
+          {
+            echo ""
+            echo "---"
+            echo "**macOS first launch:** the app is unsigned, so the first open is"
+            echo "blocked. Double-click it once, then System Settings → Privacy &"
+            echo "Security → scroll down → **Open Anyway** (macOS 15+ removed the"
+            echo "right-click→Open shortcut for unsigned apps). One time only."
+            echo "Terminal alternative: \`xattr -dr com.apple.quarantine Rsyncronizer.app\`"
+          } >> release-notes.md
+      - uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          name: ${{ github.ref_name }}
+          body_path: release-notes.md
+          files: |
+            rsyncronizer-*-macos-arm64.zip
+            rsyncronizer-*-linux-x86_64.tar.gz
+            rsyncronizer-cli-*.tar.gz
+          fail_on_unmatched_files: true

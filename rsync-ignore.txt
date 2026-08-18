@@ -1,0 +1,96 @@
+# Shared exclude list. Applies to EVERY backup on EVERY machine.
+# Passed to rsync as --exclude-from=<absolute path to this file>.
+#
+# SYNTAX
+#   One rule per line. A line whose FIRST character is '#' is a comment, and
+#   there are no trailing comments -- a rule with a comment after it becomes a
+#   literal pattern that matches nothing.
+#
+#   Every rule below carries an explicit '- ' prefix: dash, SPACE, pattern.
+#   The space is required. '- foo' is an exclude rule; '-foo' is a literal
+#   pattern for a file named "-foo". The prefix exists so that entries which
+#   themselves begin with '#' -- Synology's #recycle -- are not swallowed as
+#   comments. Verified working in --exclude-from on both GNU rsync 3.2.7 and
+#   macOS openrsync.
+#
+# ANCHORING
+#   Entries are bare basenames and match at ANY depth. Never begin an entry
+#   with '/' and never put a '/' inside one: that anchors it to the transfer
+#   root, which differs between the two backups (Documents/... vs backup/...),
+#   so a shared anchored rule would silently never match.
+#
+# DELIBERATELY NOT EXCLUDED
+#   .git/   Dropping it strips history, branches and stashes. For any repo
+#           without an upstream remote the backup would not be a backup. The
+#           slower scan phase is accepted. This was decided; do not "optimise".
+#   build/  in a C++/3D tree these may hold real, non-reproducible output.
+#           Add it below only deliberately.
+#   Filenames containing | < > : " ? * \
+#           A normal Linux filesystem (ext4 and friends) has NO filename
+#           character restriction; only FAT-family destinations do. If a file
+#           ever does fail to transfer, the rsync log names it.
+
+# A trailing slash means "directory only", so a FILE that happens to be called
+# build or venv is still backed up. Entries without one match either.
+
+# --- macOS metadata --------------------------------------------------------
+- .DS_Store
+- ._*
+- .Spotlight-V100
+- .DocumentRevisions-V100
+- .TemporaryItems
+- .Trashes
+- .fseventsd
+- .apdisk
+- .localized
+
+# --- Synology writes these into every share --------------------------------
+- @eaDir
+- @tmp
+- #recycle
+
+# --- Linux / editor noise --------------------------------------------------
+- .Trash-*
+- lost+found
+- *.swp
+- *.swo
+- *~
+
+# --- IDE / toolchain state -------------------------------------------------
+- .idea/
+- .vscode/
+- .vs/
+- *.xcuserdata*
+- DerivedData/
+- .gradle/
+
+# --- regenerable developer artifacts ---------------------------------------
+# All of these are rebuilt from source that IS backed up.
+- __pycache__/
+- *.pyc
+- *.pyo
+- .venv/
+- venv/
+- env/
+- virtualenv/
+- .mypy_cache/
+- .pytest_cache/
+- .ipynb_checkpoints/
+- node_modules/
+
+# --- compiled output -------------------------------------------------------
+# Checked before enabling: all 17 build/ dirs under ~/Documents are CMake
+# output (CMakeCache.txt, CMakeFiles, Makefile, .dylib), ~1.0 GB total, and
+# none are under OZU_VGL or 3D_Objects -- so no render output is affected.
+# If you ever keep non-reproducible output in a folder called build, either
+# rename it or delete this rule.
+- build/
+- dist/
+- target/
+- .cache/
+
+# --- this tool's own interrupted-transfer scratch --------------------------
+# Chain-specific and easy to miss: the workstation's SOURCE is the MacBook's
+# DESTINATION, so without this rule the Mac's half-written files would be
+# faithfully propagated onward to the NAS.
+- .rsync-partial

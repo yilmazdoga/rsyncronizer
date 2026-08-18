@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Rsyncronizer
+Comment=Append-only rsync backups: wizard, status, runs
+Exec=@EXEC@
+Icon=rsyncronizer
+Terminal=false
+Categories=Utility;System;

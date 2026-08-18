@@ -1,0 +1,69 @@
+# CI: every pull request, plus pushes to main (the post-merge signal).
+# PR branches are covered by the pull_request event alone -- running push on
+# every branch too would double every job.
+#
+# Job names are deliberately non-matrix and stable: branch protection's
+# required checks match exact check names (a matrix leg reports as
+# "name (leg)" and a required plain name would block merges forever).
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test-macos:
+    name: test-macos
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: bash suite (openrsync, hdiutil volume tests included)
+        run: ./tests/run-tests.sh
+
+  test-linux:
+    name: test-linux
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: bash suite (GNU rsync)
+        run: ./tests/run-tests.sh
+
+  gui-tests-macos:
+    name: gui-tests-macos
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r gui/requirements-dev.txt
+      - name: pytest (offscreen)
+        working-directory: gui
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python -m pytest tests -q
+
+  gui-tests-linux:
+    name: gui-tests-linux
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Qt runtime deps (offscreen still loads libEGL/xkb)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libegl1 libxkbcommon0
+      - run: pip install -r gui/requirements-dev.txt
+      - name: pytest (offscreen)
+        working-directory: gui
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python -m pytest tests -q

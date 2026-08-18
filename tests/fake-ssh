@@ -1,0 +1,81 @@
+#!/bin/bash
+# Stand-in for ssh, driven by env:
+#   FAKE_SSH_ARGV        where to record the argv (one arg per line)
+#   FAKE_SSH_EXIT        exit immediately with this code (255 = unreachable)
+#   FAKE_SSH_NO_PATH=1   the remote cd fails (bad ENGINE_PATH)
+#   FAKE_SSH_NO_VERSION=1  engine present but pre-VERSION (too old)
+# Otherwise it answers the handshake with 0.1.0, serves a canned porcelain
+# status, and echoes runner invocations.
+
+: "${FAKE_SSH_ARGV:=/tmp/fake-ssh-argv.txt}"
+
+: >"$FAKE_SSH_ARGV"
+for a in "$@"; do
+    printf '%s\n' "$a" >>"$FAKE_SSH_ARGV"
+done
+
+[ -n "${FAKE_SSH_EXIT:-}" ] && exit "$FAKE_SSH_EXIT"
+
+# The remote command is the last argument.
+cmd=""
+for a in "$@"; do cmd=$a; done
+
+if [ -n "${FAKE_SSH_NO_PATH:-}" ]; then
+    echo "bash: cd: no such file or directory" >&2
+    exit 1
+fi
+
+case $cmd in
+    *"cat VERSION"*)
+        if [ -n "${FAKE_SSH_NO_VERSION:-}" ]; then
+            echo "NOVERSION"
+        else
+            echo "0.1.0"
+        fi
+        exit 0
+        ;;
+    *"status.sh --porcelain"*)
+        cat <<'EOF'
+NOW=2026-08-11 12:00:00 +0100
+HOSTNAME=fakebox
+RSYNC_BIN=/usr/bin/rsync
+RSYNC_FLAVOUR=gnu
+
+BACKUP=remote-backup
+SRC=/home/fake/data
+SRC_MISSING=0
+DEST=nas:/volume1/backup
+DEST_TYPE=ssh
+SCHEDULE=0 5 * * *
+TRIGGER=0
+RUNNER_MISSING=0
+NEVER_RAN=0
+LAST_WHEN=2026-08-11 05:00:10
+LAST_EPOCH=1786500010
+RC=0
+VERDICT=SUCCESS
+FILES=12
+TOTAL_FILES=32098
+ELAPSED=64
+DRY=0
+TRIGGERED=cron
+STALE=0
+WAITING=0
+BOOTSTRAP_ALERT=0
+LOG=/home/fake/repo/logs/remote-backup/x.log
+EOF
+        exit 0
+        ;;
+    true)
+        exit "${FAKE_SSH_TRUE_EXIT:-0}"
+        ;;
+    *"backups/"*)
+        echo "fake-remote: would exec: $cmd"
+        echo "RESULT: SUCCESS (0)"
+        exit "${FAKE_SSH_RUN_EXIT:-0}"
+        ;;
+    *)
+        echo "fake-ssh: unhandled command: $cmd" >&2
+        exit 2
+        ;;
+esac
