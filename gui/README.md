@@ -49,6 +49,17 @@ rclone surfaces in three narrower places instead — a blocking message on the
 wizard's cloud page, a dashboard banner only when a cloud backup already
 exists, and a per-card warning.
 
+## Diagnosing a dead update button
+
+`rsyncronizer --update-check` prints the installed version, the release feed it
+asks and, when the check fails, the reason — the check itself runs once at
+startup in a background thread and must never break startup, so it reports
+nothing on its own. `RBS_UPDATE_API_URL` points it at a local file.
+
+The app ships `certifi`'s CA bundle: PyInstaller bundles OpenSSL but no trust
+store, and the bundled libcrypto looks for one at the *build* machine's
+OPENSSLDIR, which does not exist on a user's machine.
+
 ## Data layout
 
 The app is self-contained. On first launch (and on version change) it

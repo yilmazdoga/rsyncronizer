@@ -111,3 +111,68 @@ def test_apply_update_rolls_back_on_bad_archive(tmp_path):
 
 def test_install_target_none_when_running_from_source():
     assert updater.install_target() is None
+
+
+# --------------------------------------------------------------------------
+# A frozen app has no trust store unless we ship one
+# --------------------------------------------------------------------------
+
+def test_ssl_context_has_trust_anchors():
+    """The whole 0.3.0 update failure in one assertion.
+
+    PyInstaller bundles libssl/libcrypto but no CA bundle, and the bundled
+    libcrypto looks for one at the BUILD machine's OPENSSLDIR
+    (/Library/Frameworks/Python.framework/.../etc/openssl) -- a path that does
+    not exist on a user's machine. A context with zero CAs cannot verify
+    anything, so every HTTPS call failed and the update button never appeared.
+    """
+    ctx = updater._ssl_context()
+    assert ctx.cert_store_stats()["x509_ca"] > 0, (
+        "no trust anchors: the app cannot verify any TLS certificate")
+    assert ctx.verify_mode == updater.ssl.CERT_REQUIRED, (
+        "verification must stay ON -- an update is code we are about to run")
+
+
+def test_ssl_context_prefers_the_shipped_bundle():
+    # certifi is a declared runtime dependency precisely so the bundle carries
+    # its own CAs rather than depending on a path outside the app.
+    import os
+
+    certifi = __import__("certifi")
+    assert os.path.exists(certifi.where())
+
+
+def test_check_latest_records_why_it_failed():
+    # The bug behind the bug: every failure used to collapse into the same
+    # `return None` as "you are up to date", so a dead button was
+    # undiagnosable in the field.
+    def boom(req, timeout=0):
+        raise OSError("no route to host")
+
+    assert updater.check_latest("0.1.0", opener=boom) is None
+    assert "no route to host" in updater.LAST_ERROR
+    assert updater.LAST_ERROR.startswith("OSError")
+
+
+def test_check_latest_clears_the_error_when_it_succeeds():
+    updater.LAST_ERROR = "stale"
+    marker = updater._platform_asset_marker()
+    payload = {"tag_name": "v0.2.0",
+               "assets": [{"name": f"rsyncronizer-0.2.0{marker}",
+                           "browser_download_url": "https://example.invalid/a"}]}
+    assert updater.check_latest("0.1.0", opener=_opener_for(payload))
+    assert updater.LAST_ERROR == ""
+
+
+def test_being_up_to_date_is_not_an_error():
+    updater.LAST_ERROR = ""
+    assert updater.check_latest("9.9.9", opener=_opener_for({"tag_name": "v0.2.0"})) is None
+    assert updater.LAST_ERROR == "", "up to date must not look like a failure"
+
+
+def test_a_release_missing_this_platform_asset_says_so():
+    updater.LAST_ERROR = ""
+    assert updater.check_latest("0.1.0", opener=_opener_for(
+        {"tag_name": "v0.2.0",
+         "assets": [{"name": "something-else.txt", "browser_download_url": "x"}]})) is None
+    assert "no asset ending in" in updater.LAST_ERROR

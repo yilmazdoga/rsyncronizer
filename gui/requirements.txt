@@ -2,3 +2,9 @@
 # a minor line are picked up by CI; majors are excluded.
 PySide6>=6.7,<7
 pyinstaller>=6.6,<7
+# The CA bundle, shipped INSIDE the app. PyInstaller bundles libssl/libcrypto
+# but no trust store, and the bundled libcrypto looks for one at the build
+# machine's OPENSSLDIR -- a path that does not exist on a user's machine. That
+# silently killed the 0.3.0 update check. certifi's PyInstaller hook copies
+# cacert.pem into the bundle for us.
+certifi>=2024.2.2

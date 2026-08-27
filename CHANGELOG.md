@@ -8,6 +8,53 @@ The release workflow extracts the matching `## [x.y.z]` section of this file
 as the GitHub Release body, so keep each release's notes complete and
 self-contained.
 
+## [0.3.2] - 2026-08-27
+
+### Fixed
+
+- **The desktop app's "Update Available" button never appeared.** The app
+  checked GitHub over HTTPS and the check failed every time, silently.
+
+  PyInstaller bundles OpenSSL but no trust store, and the bundled libcrypto is
+  compiled to look for one at the *build* machine's path —
+
+  ```
+  OPENSSLDIR = /Library/Frameworks/Python.framework/Versions/3.12/etc/openssl
+  ```
+
+  — which does not exist on anyone else's Mac. The 0.3.0 bundle carried zero
+  `.pem` files and its `_ssl` links only the bundled OpenSSL, with no fallback
+  to Apple's keychain, so the app had no trust anchors at all and every HTTPS
+  request raised `SSLCertVerificationError`.
+
+  `certifi` is now a declared runtime dependency and its CA bundle ships inside
+  the app, so verification no longer depends on any path outside it. A source
+  checkout falls back to the OS trust store.
+
+- **The update check swallowed every failure into "you are up to date".** One
+  bare `except Exception: return None` covered offline, DNS, TLS, rate limits
+  and a malformed feed alike, which is how a completely dead update button
+  shipped unnoticed. Failures are now recorded and written to stderr, and
+  "nothing newer" is kept distinct from "the check did not work".
+
+- New `rsyncronizer --update-check`: prints the installed version, the feed it
+  asks, and the reason when the check fails. Exits non-zero on a real failure.
+  The GUI also honours `RBS_UPDATE_API_URL` now, the seam the CLI already had.
+
+### If you are on 0.3.0 or 0.3.1
+
+The fix cannot reach you through the thing it fixes. Either download 0.3.2
+from the Releases page by hand, or start the existing app once with a working
+trust store and use its button:
+
+```bash
+SSL_CERT_FILE=/etc/ssl/cert.pem \
+  /Applications/Rsyncronizer.app/Contents/MacOS/rsyncronizer
+```
+
+The CLI (`rsyncronizer update`) was never affected: it uses `curl`, which
+reads the system trust store.
+
 ## [0.3.1] - 2026-08-27
 
 ### Fixed

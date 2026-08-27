@@ -41,7 +41,12 @@ a = Analysis(
     pathex=[SPECPATH],
     binaries=[],
     datas=datas,
-    hiddenimports=[],
+    # certifi is imported inside a try/except in updater.py, and its
+    # PyInstaller hook is what copies cacert.pem into the bundle. Named
+    # explicitly so a change to that import shape cannot quietly drop the CA
+    # bundle again -- without it the frozen app has NO trust anchors and every
+    # update check fails silently.
+    hiddenimports=["certifi"],
     hookspath=[],
     runtime_hooks=[],
     excludes=[],

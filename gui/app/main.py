@@ -3,6 +3,11 @@
 `rsyncronizer --self-check` never touches Qt widgets: it materializes the
 engine, runs status.sh --porcelain, prints a summary and exits with the
 status exit code — usable over ssh on a machine with no display.
+
+`rsyncronizer --update-check` does the same for self-update: it prints what
+the app believes it is, what the release feed offers, and the REASON when the
+check fails. The check itself is silent by design (it must never break
+startup), so this is the only way to see a failure from the outside.
 """
 
 from __future__ import annotations
@@ -20,6 +25,26 @@ def main() -> int:
     if "--self-check" in sys.argv:
         from . import engine
         return engine.self_check()
+
+    if "--update-check" in sys.argv:
+        # Field diagnosis for a dead "Update Available" button. The check runs
+        # once at startup in a background thread and reports nothing when it
+        # fails, so without this there is no way to see WHY -- which is how a
+        # frozen build with no CA bundle shipped and looked simply "up to date".
+        from . import updater
+        from .version import app_version
+
+        current = app_version()
+        info = updater.check_latest(current)
+        print(f"installed   : {current}")
+        print(f"feed        : {updater.LATEST_URL}")
+        if info:
+            print(f"available   : {info['version']}  ({info['asset_name']})")
+        elif updater.LAST_ERROR:
+            print(f"FAILED      : {updater.LAST_ERROR}")
+        else:
+            print("available   : nothing newer")
+        return 1 if updater.LAST_ERROR else 0
 
     from PySide6.QtWidgets import (
         QApplication,

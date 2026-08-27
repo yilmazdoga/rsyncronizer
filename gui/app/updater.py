@@ -15,13 +15,74 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import ssl
 import subprocess
 import sys
 import tempfile
 import urllib.request
 
 GITHUB_REPO = "yilmazdoga/rsyncronizer"
-LATEST_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+# Overridable so a failing update check can be reproduced against a local file,
+# the same seam the CLI has as RBS_UPDATE_API_URL.
+LATEST_URL = os.environ.get(
+    "RBS_UPDATE_API_URL",
+    f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest")
+
+# Why the last check found nothing. "" means it succeeded (or has not run).
+#
+# This exists because the check used to swallow every failure into the same
+# `return None` as "you are up to date", which made a dead update button
+# completely undiagnosable in the field -- see check_latest.
+LAST_ERROR = ""
+
+
+def _ssl_context() -> ssl.SSLContext:
+    """A verifying TLS context that also works inside a frozen app.
+
+    PyInstaller bundles libssl/libcrypto but NOT a trust store, and the bundled
+    libcrypto is compiled to look for one at the BUILD machine's path --
+    measured on the 0.3.0 macOS build:
+
+        OPENSSLDIR = /Library/Frameworks/Python.framework/Versions/3.12/etc/openssl
+
+    which does not exist on a user's Mac. The bundle carried zero .pem files and
+    _ssl links only the bundled OpenSSL (no Apple Security framework), so there
+    was nothing to fall back to: every HTTPS call raised
+    SSLCertVerificationError and the update button silently never appeared.
+
+    certifi ships the CA bundle inside the app, which removes the dependency on
+    any path outside it. The OS store is the fallback for a source checkout.
+    """
+    try:
+        import certifi
+
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        pass
+    ctx = ssl.create_default_context()
+    try:
+        if ctx.cert_store_stats().get("x509_ca", 0):
+            return ctx
+    except Exception:
+        return ctx
+    for path in ("/etc/ssl/cert.pem",                     # macOS
+                 "/etc/ssl/certs/ca-certificates.crt",    # Debian/Ubuntu
+                 "/etc/pki/tls/certs/ca-bundle.crt"):     # Fedora/RHEL
+        if os.path.exists(path):
+            try:
+                ctx.load_verify_locations(cafile=path)
+                break
+            except Exception:
+                continue
+    return ctx
+
+
+def _default_opener(req, timeout=6):
+    """urlopen with an explicit trust store.
+
+    Kept to the (req, timeout) shape the injected test openers use, so the
+    context is a detail of the real path only."""
+    return urllib.request.urlopen(req, timeout=timeout, context=_ssl_context())
 
 
 def parse_version(text: str) -> tuple:
@@ -45,18 +106,28 @@ def check_latest(current_version: str, opener=None) -> dict | None:
     """{'version': ..., 'asset_url': ..., 'asset_name': ...} when a newer
     release with a matching platform asset exists; None otherwise (including
     any network failure — an update check must never break startup)."""
-    opener = opener or urllib.request.urlopen
+    global LAST_ERROR
+    LAST_ERROR = ""
+    opener = opener or _default_opener
     try:
         req = urllib.request.Request(
             LATEST_URL, headers={"Accept": "application/vnd.github+json",
                                  "User-Agent": "rsyncronizer"})
         with opener(req, timeout=6) as resp:
             data = json.load(resp)
-    except Exception:
+    except Exception as exc:
+        # Record AND report. A silent failure here is indistinguishable from
+        # "up to date", which is how a dead update button went unnoticed
+        # through a whole release.
+        LAST_ERROR = f"{type(exc).__name__}: {exc}"
+        print(f"rsyncronizer: update check failed: {LAST_ERROR}", file=sys.stderr)
         return None
     tag = data.get("tag_name", "")
-    if not tag or not is_newer(tag, current_version):
+    if not tag:
+        LAST_ERROR = "the release feed carried no tag_name"
         return None
+    if not is_newer(tag, current_version):
+        return None                      # genuinely up to date; not an error
     marker = _platform_asset_marker()
     for asset in data.get("assets", []):
         name = asset.get("name", "")
@@ -64,12 +135,14 @@ def check_latest(current_version: str, opener=None) -> dict | None:
             return {"version": tag.lstrip("vV"),
                     "asset_url": asset.get("browser_download_url", ""),
                     "asset_name": name}
+    LAST_ERROR = f"release {tag} has no asset ending in {marker}"
+    print(f"rsyncronizer: update check: {LAST_ERROR}", file=sys.stderr)
     return None
 
 
 def download(url: str, dest_dir: str, on_progress=None, opener=None) -> str:
     """Download url into dest_dir; returns the file path."""
-    opener = opener or urllib.request.urlopen
+    opener = opener or _default_opener
     path = os.path.join(dest_dir, url.rsplit("/", 1)[-1] or "asset")
     req = urllib.request.Request(url, headers={"User-Agent": "rsyncronizer"})
     with opener(req, timeout=30) as resp, open(path, "wb") as out:
