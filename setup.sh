@@ -17,10 +17,16 @@ CRON_TAG_PREFIX='rsync-backup-scripts'
 # (parsed with config_get, never sourced). Built for the GUI apps; usable by
 # hand. One key per prompt site:
 #   A_NAME A_SOURCE A_DEST_KIND A_HOST A_USER A_DEST_PATH A_VOLUME_ROOT
+#   A_CLOUD_PROVIDER A_RCLONE_REMOTE A_CREATE_REMOTE
 #   A_CONFIRM_LANDING A_EXCLUDE_OFFER A_EXCLUDE_ADD A_EXCLUDE_MORE
 #   A_CREATE_DEST A_RUN_DRY_RUN A_INSTALL_TRIGGER A_TRIGMODE
 #   A_SCHEDULE_YN A_SCHEDULE_CHOICE A_SCHEDULE_CUSTOM A_CRON_CONFIRM
 #   A_CRON_REMOVE A_REMOVE (for --remove NAME)
+# A_DEST_KIND is 1 = another machine over SSH, 2 = a local drive, 3 = cloud.
+# There are deliberately NO keys for cloud credentials: an answers file is a
+# plain file on disk, and an access key does not belong in one. rclone owns
+# every secret, and a remote that does not exist yet is a hard error in
+# headless mode rather than something this script tries to create.
 # An absent key behaves exactly like pressing Enter: the prompt's default, and
 # for a [y/N] confirm the safe N. A_USER also accepts the sentinel @none for
 # an explicitly blank username (absent means "accept the ssh -G prefill").
@@ -280,6 +286,9 @@ if [ -n "$REMOVE_NAME" ]; then
         warn "no backup named '$NAME' is configured here (looked in $CFG)"
         exit 78
     fi
+    # Read before rm -rf: the message below needs it, and the config is gone
+    # a few lines further down.
+    _rm_remote=$(config_get "$CFG/destination.txt" RCLONE_REMOTE 2>/dev/null) || _rm_remote=''
     say "Removing the backup schedule '$NAME' from THIS machine:"
     say "  - its cron entry / drive-connect trigger"
     say "  - config/$NAME, logs/$NAME and backups/$NAME.sh"
@@ -314,6 +323,11 @@ if [ -n "$REMOVE_NAME" ]; then
     rm -rf "$CFG" "$REPO_ROOT/logs/$NAME" "$REPO_ROOT/backups/$NAME.sh"
     say "  [ok]   removed config/$NAME, logs/$NAME and backups/$NAME.sh"
     say "Done. '$NAME' no longer runs on this machine; the destination data is untouched."
+    if [ -n "$_rm_remote" ]; then
+        say ""
+        say "The rclone account '$_rm_remote:' and everything stored in it are NOT touched."
+        say "Remove the account itself with: rclone config"
+    fi
     exit 0
 fi
 
@@ -346,6 +360,7 @@ if [ -d "$CFG" ]; then
 fi
 
 OLD_SRC=''; OLD_USER=''; OLD_HOST=''; OLD_DPATH=''; OLD_DTYPE=''; OLD_VOLROOT=''
+OLD_RREMOTE=''; OLD_CPROV=''
 if [ "$EDITING" = 1 ]; then
     OLD_SRC=$(config_first_line "$CFG/source.txt" 2>/dev/null) || OLD_SRC=''
     OLD_USER=$(config_get "$CFG/destination.txt" USER 2>/dev/null)
@@ -353,6 +368,8 @@ if [ "$EDITING" = 1 ]; then
     OLD_DPATH=$(config_get "$CFG/destination.txt" DEST_PATH 2>/dev/null)
     OLD_DTYPE=$(config_get "$CFG/destination.txt" DEST_TYPE 2>/dev/null)
     OLD_VOLROOT=$(config_get "$CFG/destination.txt" VOLUME_ROOT 2>/dev/null)
+    OLD_RREMOTE=$(config_get "$CFG/destination.txt" RCLONE_REMOTE 2>/dev/null)
+    OLD_CPROV=$(config_get "$CFG/destination.txt" CLOUD_PROVIDER 2>/dev/null)
 fi
 
 # --- 2. source -------------------------------------------------------------
@@ -371,13 +388,27 @@ say ""
 say "Where does this back up TO?"
 say "  1) Another machine over SSH   (runs on a schedule)"
 say "  2) A drive plugged into this machine  (runs when you connect it)"
-DEST_KIND=$(ask A_DEST_KIND "Choice" "$([ "$OLD_DTYPE" = local ] && echo 2 || echo 1)")
+say "  3) A cloud service -- S3, Google Drive, OneDrive or Dropbox (runs on a schedule)"
+case $OLD_DTYPE in
+    local) _kind_default=2 ;;
+    cloud) _kind_default=3 ;;
+    *)     _kind_default=1 ;;
+esac
+while :; do
+    DEST_KIND=$(ask A_DEST_KIND "Choice" "$_kind_default")
+    case $DEST_KIND in
+        1|2|3) break ;;
+        *) warn "choose 1, 2 or 3" ;;
+    esac
+done
 
 DEST_TYPE=ssh
 VOLUME_ROOT=''
 DEST_FS=''
 DEST_USER=''
 DEST_HOST=''
+RCLONE_REMOTE=''
+CLOUD_PROVIDER=''
 
 if [ "$DEST_KIND" = 2 ]; then
     DEST_TYPE=local
@@ -429,13 +460,104 @@ if [ "$DEST_KIND" = 2 ]; then
 
     DEST_PATH=$(ask A_DEST_PATH "Folder ON the drive to back up into" "${OLD_DPATH:-$VOLUME_ROOT/$(hostname -s 2>/dev/null || echo backup)}")
     case $DEST_PATH in /*) ;; *) DEST_PATH=$VOLUME_ROOT/$DEST_PATH ;; esac
-else
+elif [ "$DEST_KIND" = 1 ]; then
     say ""
     say "Destination. Use an ~/.ssh/config alias or a hostname/IP. Key-based auth only."
     while :; do
         DEST_HOST=$(ask A_HOST "Destination host" "$OLD_HOST")
         [ -n "$DEST_HOST" ] && break
         warn "a host is required"
+    done
+fi
+
+if [ "$DEST_KIND" = 3 ]; then
+    DEST_TYPE=cloud
+    command -v detect_rclone >/dev/null 2>&1 \
+        || { warn "this engine has no cloud support (lib/cloud.sh is missing)"; exit 1; }
+    if ! detect_rclone; then
+        warn "rclone is not installed. Cloud destinations need it; SSH and drive backups do not."
+        rclone_install_hint >&2
+        exit 1
+    fi
+    if [ "$RCLONE_VERSION" != unknown ] && ! _rclone_version_ge "$RCLONE_VERSION" "$RBS_RCLONE_MIN"; then
+        warn "rclone $RCLONE_VERSION is older than $RBS_RCLONE_MIN, which this needs."
+        rclone_install_hint >&2
+        exit 1
+    fi
+    say "  [ok]   rclone: $RCLONE_BIN ($RCLONE_VERSION)"
+
+    say ""
+    say "Which service?"
+    say "  1) Amazon S3 (or S3-compatible)   2) Google Drive"
+    say "  3) OneDrive                       4) Dropbox"
+    say "  5) Another remote already in rclone.conf"
+    case $OLD_CPROV in
+        s3) _cp_default=1 ;; drive) _cp_default=2 ;; onedrive) _cp_default=3 ;;
+        dropbox) _cp_default=4 ;; other) _cp_default=5 ;; *) _cp_default=2 ;;
+    esac
+    while :; do
+        _cp_choice=$(ask A_CLOUD_PROVIDER "Choice" "$_cp_default")
+        case $_cp_choice in
+            1) CLOUD_PROVIDER=s3 ;;      2) CLOUD_PROVIDER=drive ;;
+            3) CLOUD_PROVIDER=onedrive ;; 4) CLOUD_PROVIDER=dropbox ;;
+            5) CLOUD_PROVIDER=other ;;
+            *) warn "choose 1-5"; continue ;;
+        esac
+        break
+    done
+
+    # rclone owns the credentials. This script only ever learns the NAME of a
+    # remote, never a key, a token or a password.
+    say ""
+    say "rclone accounts configured on this machine:"
+    REMOTES=$("$RCLONE_BIN" listremotes 2>/dev/null)
+    if [ -n "$REMOTES" ]; then
+        printf '%s\n' "$REMOTES" | sed 's/^/    /' >&2
+    else
+        say "    (none yet)"
+    fi
+    say ""
+    say "  Credentials live in rclone's own config, never in this repo."
+    while :; do
+        RCLONE_REMOTE=$(ask A_RCLONE_REMOTE "Account name (no colon)" "$OLD_RREMOTE")
+        RCLONE_REMOTE=${RCLONE_REMOTE%:}
+        case $RCLONE_REMOTE in
+            ''|[!A-Za-z0-9]*|*[!A-Za-z0-9._-]*)
+                warn "an rclone remote name is letters, digits, . _ - and starts with a letter or digit"
+                continue ;;
+        esac
+        if printf '%s\n' "$REMOTES" | grep -xF -- "$RCLONE_REMOTE:" >/dev/null 2>&1; then
+            break
+        fi
+        # Creating a remote is INTERACTIVE ONLY. In headless mode the caller
+        # (the desktop app) connects the account first and passes the name;
+        # this script must never launch a browser flow it cannot drive.
+        if [ -n "$ANSWERS_FILE" ]; then
+            warn "the rclone remote '$RCLONE_REMOTE:' is not configured on this machine."
+            warn "  Create it first with: rclone config"
+            exit 78
+        fi
+        warn "'$RCLONE_REMOTE:' is not configured yet."
+        if confirm A_CREATE_REMOTE "  Run 'rclone config' now to set it up?"; then
+            "$RCLONE_BIN" config
+            REMOTES=$("$RCLONE_BIN" listremotes 2>/dev/null)
+        fi
+    done
+
+    if [ "$CLOUD_PROVIDER" = s3 ]; then
+        say ""
+        say "  For S3 the first path segment is the BUCKET, e.g. my-bucket/backups"
+    fi
+    while :; do
+        DEST_PATH=$(ask A_DEST_PATH "Folder inside $RCLONE_REMOTE: (the folder your source will be placed INSIDE)" \
+                        "${OLD_DPATH:-Rsyncronizer/$(hostname -s 2>/dev/null || echo machine)}")
+        case $DEST_PATH in
+            '')  warn "a destination path is required"; continue ;;
+            -*)  warn "the path may not begin with '-'"; continue ;;
+            /*)  warn "give a path INSIDE the remote, with no leading '/'"; continue ;;
+            *:*) warn "the path may not contain ':' -- the account is named separately"; continue ;;
+        esac
+        break
     done
 fi
 
@@ -467,6 +589,9 @@ done
 
 if [ "$DEST_TYPE" = local ]; then
     LANDING="$DEST_PATH/${SRC##*/}/"
+elif [ "$DEST_TYPE" = cloud ]; then
+    REMOTE=''
+    LANDING="$RCLONE_REMOTE:$DEST_PATH/${SRC##*/}/"
 elif [ -n "$DEST_USER" ]; then
     REMOTE="$DEST_USER@$DEST_HOST"; LANDING="$REMOTE:$DEST_PATH/${SRC##*/}/"
 else
@@ -489,11 +614,15 @@ confirm A_CONFIRM_LANDING "Is that correct?" || { say "Aborted; nothing was writ
 say ""
 say "Preflight checks"
 
-detect_rsync && say "  [ok]   local rsync: $RSYNC_BIN ($RSYNC_FLAVOUR)" \
-             || { warn "no rsync found on PATH"; exit 1; }
-if [ "$RSYNC_FLAVOUR" = openrsync ]; then
-    say "         openrsync supports everything this repo uses. 'brew install rsync'"
-    say "         is optional (it adds --protect-args for paths containing spaces)."
+# A cloud backup never invokes rsync, so a machine that only backs up to the
+# cloud is not required to have it.
+if [ "$DEST_TYPE" != cloud ]; then
+    detect_rsync && say "  [ok]   local rsync: $RSYNC_BIN ($RSYNC_FLAVOUR)" \
+                 || { warn "no rsync found on PATH"; exit 1; }
+    if [ "$RSYNC_FLAVOUR" = openrsync ]; then
+        say "         openrsync supports everything this repo uses. 'brew install rsync'"
+        say "         is optional (it adds --protect-args for paths containing spaces)."
+    fi
 fi
 
 SRC_COUNT=$(find "$SRC" -mindepth 1 -maxdepth 1 2>/dev/null | wc -l | tr -d ' ')
@@ -640,6 +769,83 @@ if [ "$DEST_TYPE" = ssh ] && [ "$SSH_OK" = 1 ]; then
     fi
 fi
 
+if [ "$DEST_TYPE" = cloud ]; then
+    # Probe rclone the way CRON will. This is the exact counterpart of the
+    # `env -u SSH_AUTH_SOCK ssh -o BatchMode=yes` probe above: an ENCRYPTED
+    # rclone.conf passes every interactive check and then blocks forever at a
+    # password prompt on every scheduled run, holding the lock, with nobody
+    # watching. --ask-password=false turns that into a fast, legible failure.
+    if "$RCLONE_BIN" config show "$RCLONE_REMOTE:" --ask-password=false >/dev/null 2>&1 </dev/null; then
+        say "  [ok]   rclone.conf is readable with no password (cron-equivalent)"
+    else
+        warn "rclone's config could not be read without a password."
+        warn "  An encrypted rclone.conf cannot work under cron -- nothing is there to type it."
+        warn "  Remove the password: rclone config  ->  s) Set configuration password  ->  remove"
+    fi
+    if "$RCLONE_BIN" lsd "$RCLONE_REMOTE:" --max-depth 1 --ask-password=false >/dev/null 2>&1 </dev/null; then
+        say "  [ok]   $RCLONE_REMOTE: answers with no interaction"
+    else
+        warn "could not list $RCLONE_REMOTE: without interaction."
+        warn "  Re-authorise it: rclone config reconnect $RCLONE_REMOTE:"
+    fi
+    # S3 has no `about` at all, so a failure here is a note and never an error.
+    if _ab=$("$RCLONE_BIN" about "$RCLONE_REMOTE:" 2>/dev/null </dev/null); then
+        say "  [ok]   quota: $(printf '%s' "$_ab" | tr '\n' ' ')"
+    else
+        say "         (this service does not report a free-space figure)"
+    fi
+    if "$RCLONE_BIN" lsf "$RCLONE_REMOTE:$DEST_PATH" --max-depth 1 --ask-password=false >/dev/null 2>&1 </dev/null; then
+        say "  [ok]   destination exists: $RCLONE_REMOTE:$DEST_PATH"
+    else
+        warn "destination does not exist yet: $RCLONE_REMOTE:$DEST_PATH"
+        if confirm A_CREATE_DEST "  Create it now?"; then
+            "$RCLONE_BIN" mkdir "$RCLONE_REMOTE:$DEST_PATH" </dev/null \
+                && say "  [ok]   created" || warn "could not create it"
+        fi
+    fi
+    # A write test that leaves its evidence behind on purpose. Deleting a
+    # remote object here would be the ONLY deletion in this product outside
+    # the guarded --sync-deletions path, and would need the same machinery to
+    # be defensible; one tiny marker is a fair price. It also sits in the
+    # PARENT of the transfer root, so it can never appear in a deletion list.
+    if printf '%s\n' \
+        "# Written by Rsyncronizer's setup.sh. Safe to delete." \
+        "# It records that this machine could write here at setup time." \
+        "backup=$NAME" \
+        "host=$(hostname 2>/dev/null || echo unknown)" \
+        "when=$(date '+%Y-%m-%d %H:%M:%S %z')" \
+        | "$RCLONE_BIN" rcat "$RCLONE_REMOTE:$DEST_PATH/.rsyncronizer-write-test" \
+              --ask-password=false >/dev/null 2>&1; then
+        say "  [ok]   wrote $RCLONE_REMOTE:$DEST_PATH/.rsyncronizer-write-test"
+    else
+        warn "could not write to $RCLONE_REMOTE:$DEST_PATH -- check the account's permissions"
+    fi
+
+    # What will look like a bug later if nobody says it now.
+    say ""
+    say "  Worth knowing about this service:"
+    case $CLOUD_PROVIDER in
+        s3)
+            say "    - No free-space figure exists, so the dashboard never shows one."
+            say "    - Reading a file's timestamp costs an extra request; the first run is slow." ;;
+        drive)
+            say "    - Google Drive caps uploads at 750 GB per day. A bigger first backup"
+            say "      simply continues the next day."
+            say "    - Deletions go to Drive's trash, so space frees only when you empty it."
+            say "    - Drive can hold two files with the same name; 'rclone dedupe' fixes that." ;;
+        onedrive)
+            say "    - Paths over 400 characters and files over 250 GB are rejected."
+            say "    - The sign-in expires after 90 days of no use:"
+            say "        rsyncronizer cloud login $RCLONE_REMOTE"
+            say "    - Versioning is on by default and can double the space a file uses." ;;
+        dropbox)
+            say "    - Some filenames are refused outright (thumbs.db and friends)."
+            say "    - Dropbox can only change a file's timestamp by uploading it again." ;;
+    esac
+    say "    - No cloud service stores symlinks, ownership or permission bits."
+    say "      Files come back as plain files owned by you."
+fi
+
 # --- 6. write config -------------------------------------------------------
 mkdir -p "$CFG" || { warn "cannot create $CFG"; exit 1; }
 
@@ -677,6 +883,25 @@ if [ "$DEST_TYPE" = local ]; then
         echo "DEST_PATH=$DEST_PATH"
         echo "DEST_FS=$DEST_FS"
     } >"$CFG/destination.txt"
+elif [ "$DEST_TYPE" = cloud ]; then
+    {
+        echo "# Destination for '$NAME': a cloud service, reached with rclone."
+        echo "DEST_TYPE=cloud"
+        echo "# The rclone remote, as named in rclone's own config."
+        echo "# List them with: rclone listremotes    (or: rsyncronizer cloud list)"
+        echo "# This is a NAME, never a credential -- no key, token or password"
+        echo "# is stored anywhere in this repo."
+        echo "RCLONE_REMOTE=$RCLONE_REMOTE"
+        echo "# Path INSIDE the remote, with no leading slash. For S3 the first"
+        echo "# segment is the bucket. The source is copied BY NAME beneath it,"
+        echo "# so this lands as $RCLONE_REMOTE:$DEST_PATH/${SRC##*/}/"
+        echo "DEST_PATH=$DEST_PATH"
+        echo "# Used only to tailor advice and provider-specific defaults."
+        echo "CLOUD_PROVIDER=$CLOUD_PROVIDER"
+        echo "# Cloud destinations store no symlinks, no ownership and no"
+        echo "# permission bits. No rclone flag changes that."
+        echo "# RCLONE_CONFIG_PATH=   # only for a non-default rclone.conf"
+    } >"$CFG/destination.txt"
 else
     {
         echo "# Destination for '$NAME'. Key-based SSH auth only, no passwords."
@@ -713,7 +938,42 @@ if [ ! -f "$CFG/options.txt" ]; then
 # COOLDOWN_HOURS=12   # skip a connect-triggered run within N hours of the last
 #                     # ATTEMPT, so replugging does not rescan the whole source.
 #                     # Force one anyway: rm logs/<name>/.last_attempt_epoch
+#
+# --- cloud (rclone) backups only ---
+# RCLONE_TRANSFERS=4  # files uploaded in parallel
+# RCLONE_CHECKERS=8   # existence checks in parallel
+# RCLONE_EXTRA_FLAGS=
+#                     # Extra rclone flags, --flag=value form ONLY: no bare
+#                     # words and no space-separated values. Deletion, filter,
+#                     # logging, --config, --rc*, --dump and --password-command
+#                     # are refused at runtime, not silently dropped. EXTRA_FLAGS
+#                     # (the rsync one) is refused on a cloud backup, and this
+#                     # key is refused on an rsync one.
 EOF
+fi
+
+# Re-running the wizard can change a backup's KIND, and the engine rejects a
+# config that carries keys from the kind it used to be. Comment those out
+# rather than leaving them to trip validation on the next run. (awk into a temp
+# file, not `sed -i`: BSD sed requires an argument to -i and GNU's does not.)
+_comment_out_key() {
+    [ -f "$1" ] || return 0
+    grep -q "^[[:space:]]*$2[[:space:]]*=" "$1" 2>/dev/null || return 0
+    awk -v k="$2" '$0 ~ "^[[:space:]]*" k "[[:space:]]*=" { print "# " $0; next } { print }' \
+        "$1" >"$1.tmp" && mv "$1.tmp" "$1"
+    say "  (commented out $2= in options.txt: it does not apply to this kind of destination)"
+}
+if [ "$DEST_TYPE" = cloud ]; then
+    _comment_out_key "$CFG/options.txt" EXTRA_FLAGS
+    _comment_out_key "$CFG/options.txt" SSH_PORT
+    _comment_out_key "$CFG/options.txt" PRESERVE_PERMS
+    _comment_out_key "$CFG/options.txt" MODIFY_WINDOW
+    _comment_out_key "$CFG/options.txt" COPY_LINKS
+    _comment_out_key "$CFG/options.txt" COOLDOWN_HOURS
+else
+    _comment_out_key "$CFG/options.txt" RCLONE_EXTRA_FLAGS
+    _comment_out_key "$CFG/options.txt" RCLONE_TRANSFERS
+    _comment_out_key "$CFG/options.txt" RCLONE_CHECKERS
 fi
 
 # exFAT and friends need these, and they are per-backup: the SSH backups run to

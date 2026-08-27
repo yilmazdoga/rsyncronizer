@@ -22,13 +22,16 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QPushButton,
     QRadioButton,
+    QStackedWidget,
     QVBoxLayout,
+    QWidget,
     QWizard,
     QWizardPage,
 )
 
 from . import engine
 from .runner_thread import RunnerThread
+from .theme import MUTED, WARN
 
 NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
@@ -96,10 +99,13 @@ class DestinationPage(QWizardPage):
         self.setTitle("Destination")
         self.ssh_radio = QRadioButton("Another machine over SSH (runs on a schedule)")
         self.drive_radio = QRadioButton("A drive plugged into this machine (runs when you connect it)")
+        self.cloud_radio = QRadioButton(
+            "A cloud service — S3, Google Drive, OneDrive or Dropbox (runs on a schedule)")
         self.ssh_radio.setChecked(True)
         group = QButtonGroup(self)
         group.addButton(self.ssh_radio)
         group.addButton(self.drive_radio)
+        group.addButton(self.cloud_radio)
 
         self.host = QLineEdit()
         self.host.setPlaceholderText("~/.ssh/config alias, hostname or IP — key-based auth only")
@@ -120,31 +126,165 @@ class DestinationPage(QWizardPage):
             lambda text: self.drive_dest.setPlaceholderText(f"{text}/{host}" if text else "")
         )
 
-        lay = QVBoxLayout(self)
-        lay.addWidget(self.ssh_radio)
-        lay.addWidget(QLabel("    Host:"))
-        lay.addWidget(self.host)
-        lay.addWidget(QLabel("    Username:"))
-        lay.addWidget(self.user)
-        lay.addWidget(QLabel("    Destination path:"))
-        lay.addWidget(self.ssh_dest)
-        lay.addWidget(self.create_dest)
+        # One panel per destination kind, in a stack. Flattening every field
+        # of every kind into a single column and enable/disable-ing them worked
+        # for two kinds; it does not survive a third.
+        self.ssh_panel = QWidget()
+        ssh_lay = QVBoxLayout(self.ssh_panel)
+        ssh_lay.setContentsMargins(0, 0, 0, 0)
+        ssh_lay.addWidget(QLabel("    Host:"))
+        ssh_lay.addWidget(self.host)
+        ssh_lay.addWidget(QLabel("    Username:"))
+        ssh_lay.addWidget(self.user)
+        ssh_lay.addWidget(QLabel("    Destination path:"))
+        ssh_lay.addWidget(self.ssh_dest)
+        ssh_lay.addWidget(self.create_dest)
         self.keys_btn = QPushButton("Set up SSH key access…")
         self.keys_btn.clicked.connect(self._setup_keys)
-        lay.addWidget(self.keys_btn)
-        lay.addSpacing(12)
-        lay.addWidget(self.drive_radio)
-        lay.addWidget(QLabel("    Volume (must be mounted now):"))
-        lay.addWidget(self.volume)
-        lay.addWidget(QLabel("    Folder ON the drive:"))
-        lay.addWidget(self.drive_dest)
+        ssh_lay.addWidget(self.keys_btn)
 
-        for w in (self.ssh_radio, self.drive_radio):
+        self.drive_panel = QWidget()
+        drive_lay = QVBoxLayout(self.drive_panel)
+        drive_lay.setContentsMargins(0, 0, 0, 0)
+        drive_lay.addWidget(QLabel("    Volume (must be mounted now):"))
+        drive_lay.addWidget(self.volume)
+        drive_lay.addWidget(QLabel("    Folder ON the drive:"))
+        drive_lay.addWidget(self.drive_dest)
+
+        self.cloud_panel = QWidget()
+        cloud_lay = QVBoxLayout(self.cloud_panel)
+        cloud_lay.setContentsMargins(0, 0, 0, 0)
+        # rclone is optional, so this is a page-level message rather than the
+        # main window's global banner -- a permanent red bar for a dependency
+        # most users never need trains people to ignore banners.
+        self.rclone_warn = QLabel()
+        self.rclone_warn.setWordWrap(True)
+        self.rclone_warn.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.rclone_warn.setStyleSheet(f"color: {WARN};")
+        self.copy_cmd_btn = QPushButton("Copy install command")
+        self.copy_cmd_btn.clicked.connect(self._copy_install_cmd)
+        cloud_lay.addWidget(self.rclone_warn)
+        cloud_lay.addWidget(self.copy_cmd_btn)
+
+        self.cloud_remote = QComboBox()
+        self.cloud_remote.currentIndexChanged.connect(self._cloud_remote_changed)
+        self.connect_btn = QPushButton("Connect an account…")
+        self.connect_btn.clicked.connect(self._connect_cloud)
+        self.cloud_bucket = QLineEdit()
+        self.cloud_bucket.setPlaceholderText("bucket name (required for S3)")
+        self.cloud_bucket_label = QLabel("    Bucket:")
+        self.cloud_dest = QLineEdit()
+        self.cloud_dest.setPlaceholderText(f"Rsyncronizer/{host}")
+        self.create_cloud_dest = QCheckBox("Create the destination folder if it does not exist")
+        self.create_cloud_dest.setChecked(True)
+        self.cloud_note = QLabel()
+        self.cloud_note.setWordWrap(True)
+        self.cloud_note.setStyleSheet(f"color: {MUTED};")
+
+        cloud_lay.addWidget(QLabel("    Account:"))
+        cloud_lay.addWidget(self.cloud_remote)
+        cloud_lay.addWidget(self.connect_btn)
+        cloud_lay.addWidget(self.cloud_bucket_label)
+        cloud_lay.addWidget(self.cloud_bucket)
+        cloud_lay.addWidget(QLabel("    Folder inside the account:"))
+        cloud_lay.addWidget(self.cloud_dest)
+        cloud_lay.addWidget(self.create_cloud_dest)
+        cloud_lay.addWidget(self.cloud_note)
+
+        self.stack = QStackedWidget()
+        self.stack.addWidget(self.ssh_panel)      # index 0
+        self.stack.addWidget(self.drive_panel)    # index 1
+        self.stack.addWidget(self.cloud_panel)    # index 2
+
+        lay = QVBoxLayout(self)
+        lay.addWidget(self.ssh_radio)
+        lay.addWidget(self.drive_radio)
+        lay.addWidget(self.cloud_radio)
+        lay.addSpacing(8)
+        lay.addWidget(self.stack)
+        lay.addStretch(1)
+
+        for w in (self.ssh_radio, self.drive_radio, self.cloud_radio):
             w.toggled.connect(self._sync)
-        for w in (self.host, self.ssh_dest, self.drive_dest):
+        for w in (self.host, self.ssh_dest, self.drive_dest,
+                  self.cloud_dest, self.cloud_bucket):
             w.textChanged.connect(self.completeChanged)
         self.volume.editTextChanged.connect(self.completeChanged)
         self._sync()
+
+    def kind(self) -> str:
+        """'ssh' | 'local' | 'cloud' -- the one place the radios are read."""
+        if self.drive_radio.isChecked():
+            return "local"
+        if self.cloud_radio.isChecked():
+            return "cloud"
+        return "ssh"
+
+    def initializePage(self):
+        # Deliberately NOT in __init__: listing rclone remotes is a subprocess,
+        # and BackupWizard() is constructed in tests and on every window open.
+        self._refresh_cloud()
+
+    def _refresh_cloud(self, select: str | None = None):
+        have = engine.rclone_path() is not None
+        self.rclone_warn.setVisible(not have)
+        self.copy_cmd_btn.setVisible(not have)
+        if not have:
+            self.rclone_warn.setText(
+                "rclone is not installed. Rsyncronizer uses it to talk to cloud "
+                "services.\n\n" + engine.rclone_install_hint()
+                + "\n\nThen reopen this page."
+            )
+        current = select or self.selected_remote_name()
+        self.cloud_remote.blockSignals(True)
+        self.cloud_remote.clear()
+        remotes = engine.list_cloud_remotes() if have else []
+        for remote in remotes:
+            label = engine.CLOUD_TYPES.get(remote["type"], remote["type"])
+            self.cloud_remote.addItem(f"{remote['name']}  ({label})", remote)
+        if not remotes:
+            self.cloud_remote.addItem("— no accounts connected —", None)
+        if current:
+            for i in range(self.cloud_remote.count()):
+                data = self.cloud_remote.itemData(i)
+                if data and data.get("name") == current:
+                    self.cloud_remote.setCurrentIndex(i)
+                    break
+        self.cloud_remote.blockSignals(False)
+        self._cloud_remote_changed()
+
+    def selected_remote(self) -> dict | None:
+        return self.cloud_remote.currentData()
+
+    def selected_remote_name(self) -> str:
+        remote = self.selected_remote()
+        return remote["name"] if remote else ""
+
+    def _cloud_remote_changed(self, *_):
+        remote = self.selected_remote()
+        rtype = remote["type"] if remote else ""
+        is_s3 = rtype == "s3"
+        self.cloud_bucket.setVisible(is_s3)
+        self.cloud_bucket_label.setVisible(is_s3)
+        note = engine.CLOUD_PROVIDER_NOTES.get(rtype, "")
+        self.cloud_note.setText((note + " " if note else "") + engine.CLOUD_NOTE_ALL)
+        self.completeChanged.emit()
+
+    def _copy_install_cmd(self):
+        from PySide6.QtWidgets import QApplication
+
+        cmd = "brew install rclone" if sys.platform == "darwin" else "sudo apt install rclone"
+        QApplication.clipboard().setText(cmd)
+        self.copy_cmd_btn.setText(f"Copied: {cmd}")
+
+    def _connect_cloud(self):
+        from .dialogs import CloudConnectDialog
+
+        dlg = CloudConnectDialog(self.window())
+        if dlg.exec():
+            self._refresh_cloud(select=dlg.remote_name)
+        else:
+            self._refresh_cloud()
 
     def _setup_keys(self):
         from .dialogs import SshSetupDialog
@@ -155,17 +295,23 @@ class DestinationPage(QWizardPage):
         SshSetupDialog(target, self.window()).exec()
 
     def _sync(self):
-        ssh = self.ssh_radio.isChecked()
-        for w in (self.host, self.user, self.ssh_dest, self.create_dest, self.keys_btn):
-            w.setEnabled(ssh)
-        for w in (self.volume, self.drive_dest):
-            w.setEnabled(not ssh)
+        self.stack.setCurrentIndex({"ssh": 0, "local": 1, "cloud": 2}[self.kind()])
         self.completeChanged.emit()
 
     def isComplete(self) -> bool:
-        if self.ssh_radio.isChecked():
+        kind = self.kind()
+        if kind == "ssh":
             return bool(self.host.text().strip()) and bool(self.ssh_dest.text().strip())
-        return bool(self.volume.currentText().strip())
+        if kind == "local":
+            return bool(self.volume.currentText().strip())
+        # Cloud. Blocking Next while rclone is missing is deliberate: it stops
+        # the user reaching a run that is certain to fail.
+        remote = self.selected_remote()
+        if engine.rclone_path() is None or remote is None:
+            return False
+        if remote["type"] == "s3" and not self.cloud_bucket.text().strip():
+            return False
+        return True
 
 
 class SchedulePage(QWizardPage):
@@ -210,12 +356,15 @@ class SchedulePage(QWizardPage):
             lay.addWidget(self.linux_note)
 
     def initializePage(self):
-        ssh = self._dest.ssh_radio.isChecked()
+        # Cloud backups run on a clock like SSH ones; only a plugged-in drive
+        # gets the connect-trigger chain. Keyed on 'is it the drive', never on
+        # 'is it ssh' -- those stopped being the same question.
+        scheduled = self._dest.kind() != "local"
         for w in (self.schedule_on, self.preset, self.custom):
-            w.setVisible(ssh)
+            w.setVisible(scheduled)
         for w in (self.trigger_on, self.poll_radio, self.launchd_radio, self.linux_note):
-            w.setVisible(not ssh and (w is not self.poll_radio and w is not self.launchd_radio or sys.platform == "darwin"))
-        if not ssh and sys.platform != "darwin":
+            w.setVisible(not scheduled and (w is not self.poll_radio and w is not self.launchd_radio or sys.platform == "darwin"))
+        if not scheduled and sys.platform != "darwin":
             self.linux_note.setVisible(True)
 
 
@@ -243,17 +392,25 @@ class ReviewPage(QWizardPage):
         # recomputes this authoritatively when setup.sh runs.
         resolved = src if os.path.isabs(src) else os.path.join(os.path.expanduser("~"), src)
         resolved = resolved.rstrip("/") or "/"
+        extra = ""
         if form["dest_kind"] == "ssh":
             remote = f"{form['user']}@{form['host']}" if form.get("user") else form["host"]
             dest = f"{remote}:{form['dest_path']}"
+        elif form["dest_kind"] == "cloud":
+            dest = engine.cloud_dest_display(form)
+            label = engine.CLOUD_TYPES.get(form.get("cloud_type", ""), form.get("cloud_type", ""))
+            note = engine.CLOUD_PROVIDER_NOTES.get(form.get("cloud_type", ""), "")
+            extra = (f"Cloud account : {form['cloud_remote']}  ({label})\n\n"
+                     + (note + "\n" if note else "") + engine.CLOUD_NOTE_ALL + "\n")
         else:
             dest = form["dest_path"] or form["volume_root"]
         lands = f"{dest}/{os.path.basename(resolved)}/"
         self.summary.setText(
             f"You entered   : {src}\n"
             f"Resolves to   : {resolved}\n"
-            f"Will land as  : {lands}\n\n"
-            "Nothing at the destination is deleted by scheduled or plain runs."
+            f"Will land as  : {lands}\n"
+            + (f"{extra}\n" if extra else "\n")
+            + "Nothing at the destination is deleted by scheduled or plain runs."
         )
 
 
@@ -319,22 +476,30 @@ class BackupWizard(QWizard):
                 btn.setObjectName("primary")
 
     def form_state(self) -> dict:
-        ssh = self.dest.ssh_radio.isChecked()
+        kind = self.dest.kind()
         form: dict = {
             "name": self.basics.name.text().strip(),
             "source": self.basics.source.text().strip(),
-            "dest_kind": "ssh" if ssh else "local",
+            "dest_kind": kind,
         }
-        if ssh:
+        # Exactly one branch contributes keys, so switching the radio back can
+        # never leave a stale field from the kind you moved away from.
+        if kind == "ssh":
             form["host"] = self.dest.host.text().strip()
             form["user"] = self.dest.user.text().strip()
             form["dest_path"] = self.dest.ssh_dest.text().strip()
             form["create_dest"] = self.dest.create_dest.isChecked()
-            if self.sched.schedule_on.isChecked():
-                idx = self.preset_index()
-                form["schedule"] = True
-                form["schedule_choice"] = SCHEDULES[idx][1]
-                form["schedule_custom"] = self.sched.custom.text().strip()
+            self._add_schedule(form)
+        elif kind == "cloud":
+            remote = self.dest.selected_remote() or {}
+            form["cloud_remote"] = remote.get("name", "")
+            form["cloud_type"] = remote.get("type", "")
+            form["cloud_bucket"] = (self.dest.cloud_bucket.text().strip()
+                                    if remote.get("type") == "s3" else "")
+            form["dest_path"] = (self.dest.cloud_dest.text().strip()
+                                 or self.dest.cloud_dest.placeholderText())
+            form["create_dest"] = self.dest.create_cloud_dest.isChecked()
+            self._add_schedule(form)
         else:
             form["volume_root"] = self.dest.volume.currentText().strip()
             form["dest_path"] = self.dest.drive_dest.text().strip() \
@@ -343,6 +508,13 @@ class BackupWizard(QWizard):
                 form["install_trigger"] = True
                 form["trigmode"] = "1" if self.sched.launchd_radio.isChecked() else "2"
         return form
+
+    def _add_schedule(self, form: dict) -> None:
+        """The cron chain, shared by the two clock-scheduled kinds."""
+        if self.sched.schedule_on.isChecked():
+            form["schedule"] = True
+            form["schedule_choice"] = SCHEDULES[self.preset_index()][1]
+            form["schedule_custom"] = self.sched.custom.text().strip()
 
     def preset_index(self) -> int:
         return self.sched.preset.currentIndex()

@@ -66,6 +66,9 @@ HAVE_LOCK=0
 BACKUP_NAME=''
 RSYNC_BIN=''
 RSYNC_FLAVOUR=''
+# Which transport this run uses: 'rsync' (DEST_TYPE ssh or local) or 'rclone'
+# (DEST_TYPE cloud). Derived from the config, never configured directly.
+TRANSPORT='rsync'
 
 # ---------------------------------------------------------------------------
 # Output
@@ -481,6 +484,10 @@ assert_prune_sanctioned() {
 # flavour branch. This list is what the user confirms and what the counts
 # come from; the deletion set itself is always computed by rsync.
 _prune_scan() {
+    if [ "${TRANSPORT:-rsync}" = rclone ]; then
+        _prune_scan_rclone "$@"
+        return
+    fi
     _ps_raw=$1
     _ps_list=$2
     assert_prune_sanctioned preview
@@ -599,7 +606,17 @@ rotate_logs() {
 }
 
 # interpret_exit CODE -- the verdict is the deliverable, not the raw number.
+#
+# The two transports have DIFFERENT and overlapping tables -- rclone 4 is "file
+# not found" where rsync 4 is "unsupported action", and rclone 5 is a temporary
+# error where rsync 5 is a protocol failure -- so the same integer must never be
+# read against the wrong one. last-run.txt records TRANSPORT= for the same
+# reason, and status.sh branches on it there.
 interpret_exit() {
+    if [ "${TRANSPORT:-rsync}" = rclone ]; then
+        _rclone_interpret_exit "$1"
+        return
+    fi
     case $1 in
         0)  log "RESULT: SUCCESS (0)" ;;
         24) log "RESULT: SUCCESS (24) -- some source files vanished while the run was in progress."
@@ -823,209 +840,10 @@ mount_gate() {
 }
 
 # ---------------------------------------------------------------------------
-# The main entry point. Every generated runner calls this and nothing else.
-# ---------------------------------------------------------------------------
-run_backup() {
-    BACKUP_NAME=$1
-    shift
-
-    DRY_RUN=''
-    FROM_CRON=''
-    PREFLIGHT_ONLY=''
-    ON_MOUNT=''
-    PRUNE=''
-    PRUNE_CONFIRMED=''
-    PRUNE_ACTIVE=''
-    while [ $# -gt 0 ]; do
-        case $1 in
-            --dry-run|-n) DRY_RUN=1 ;;
-            --cron) FROM_CRON=1 ;;
-            --preflight) PREFLIGHT_ONLY=1 ;;
-            --on-mount) ON_MOUNT=1 ;;
-            --sync-deletions) PRUNE=1 ;;
-            *) die 64 "unknown argument: $1 (accepts --dry-run, --preflight, --cron, --on-mount, --sync-deletions)" ;;
-        esac
-        shift
-    done
-
-    # --sync-deletions is the ONLY sanctioned path to deletion, and it is manual by
-    # construction. The cron/on-mount bans are unconditional -- no environment
-    # variable lifts them. The terminal check covers BOTH ends: a piped stdin
-    # cannot answer the prompt, and a redirected stdout would leave `read`
-    # blocked invisibly while holding the lock. RBS_TEST_CONFIRM_STDIN is the
-    # test seam for the TTY check alone, and it is honoured only when rsync is
-    # the stub (RSYNC_BIN_OVERRIDE) -- on the real binary it is inert, so the
-    # confirmation cannot be scripted or scheduled around.
-    if [ -n "$PRUNE" ]; then
-        [ -n "$FROM_CRON" ] && die 78 "--sync-deletions is refused on scheduled runs: deletion requires an interactive confirmation"
-        [ -n "$ON_MOUNT" ]  && die 78 "--sync-deletions is refused on drive-connect runs: deletion requires an interactive confirmation"
-        _seam=''
-        [ -n "${RBS_TEST_CONFIRM_STDIN:-}" ] && [ -n "${RSYNC_BIN_OVERRIDE:-}" ] && _seam=1
-        if [ -z "$DRY_RUN" ] && [ -z "$PREFLIGHT_ONLY" ] && [ -z "$_seam" ] \
-           && { [ ! -t 0 ] || [ ! -t 1 ]; }; then
-            die 78 "--sync-deletions needs a terminal on stdin and stdout to ask for confirmation"
-        fi
-    fi
-
-    # The mount gate runs BEFORE the log is opened, and is the only thing that
-    # does. A drive-connect trigger fires on every volume mount on the machine,
-    # so the common case must cost one stat and leave no trace.
-    if [ -n "$ON_MOUNT" ]; then
-        mount_gate "$BACKUP_NAME" "$REPO_ROOT/config/$BACKUP_NAME" || exit 0
-    fi
-
-    # The log is opened FIRST, before config is validated. The crontab line
-    # redirects to a bootstrap file, so a config error that died before the log
-    # existed would otherwise be completely silent under cron.
-    open_log "$BACKUP_NAME"
-    trap _on_exit EXIT
-    trap _on_signal INT TERM HUP
-
-    _cfg=$REPO_ROOT/config/$BACKUP_NAME
-    log "=============================================================="
-    log "backup   : $BACKUP_NAME"
-    log "started  : $(date '+%Y-%m-%d %H:%M:%S %z')"
-    log "host     : $(hostname 2>/dev/null || echo unknown)"
-    if [ -n "$ON_MOUNT" ]; then _how=drive-connect
-    elif [ -n "$FROM_CRON" ]; then _how=cron
-    else _how=manual; fi
-    log "invoked  : $_how$([ -n "$DRY_RUN" ] && echo ' (dry run)')"
-    log "=============================================================="
-
-    # --- config -----------------------------------------------------------
-    [ -d "$_cfg" ] || die 78 "no configuration for '$BACKUP_NAME'. Run ./setup.sh to create it. (looked in $_cfg)"
-    for _f in source.txt destination.txt; do
-        [ -f "$_cfg/$_f" ] || die 78 "missing $_cfg/$_f. Run ./setup.sh to recreate it."
-    done
-
-    _raw_src=$(config_first_line "$_cfg/source.txt") \
-        || die 78 "$_cfg/source.txt is empty. Run ./setup.sh."
-    SRC=$(resolve_path "$_raw_src")
-
-    DEST_USER=$(config_get "$_cfg/destination.txt" USER)
-    DEST_HOST=$(config_get "$_cfg/destination.txt" HOST)
-    DEST_PATH=$(config_get "$_cfg/destination.txt" DEST_PATH)
-    RSYNC_PATH=$(config_get "$_cfg/destination.txt" RSYNC_PATH)
-    # An EXPLICIT key, never inferred from an empty HOST: destination.txt is
-    # hand-editable, and a HOST line blanked by accident must not silently turn
-    # an SSH backup into one that writes into $HOME. Absent == ssh == the
-    # behaviour every existing config already has.
-    DEST_TYPE=$(config_get "$_cfg/destination.txt" DEST_TYPE)
-    VOLUME_ROOT=$(config_get "$_cfg/destination.txt" VOLUME_ROOT)
-    DEST_FS=$(config_get "$_cfg/destination.txt" DEST_FS)
-    [ -n "$DEST_TYPE" ] || DEST_TYPE=ssh
-
-    _unknown=$(config_unknown_keys "$_cfg/destination.txt" \
-        USER HOST DEST_PATH RSYNC_PATH DEST_TYPE VOLUME_ROOT DEST_FS)
-    [ -n "$_unknown" ] && die 78 "unknown key(s) in destination.txt: $(echo $_unknown)"
-
-    # Every one of these must be initialised BEFORE use: `set -u` makes an unset
-    # variable a fatal error, so a key that only some backups set would crash
-    # every backup that does not set it.
-    SSH_PORT=''; BWLIMIT=''; TIMEOUT=''; EXTRA_FLAGS=''; ALLOW_EMPTY_SOURCE=''
-    PRESERVE_PERMS=''; MODIFY_WINDOW=''; COOLDOWN_HOURS=''; COPY_LINKS=''
-    if [ -f "$_cfg/options.txt" ]; then
-        _unknown=$(config_unknown_keys "$_cfg/options.txt" \
-            SSH_PORT BWLIMIT TIMEOUT EXTRA_FLAGS ALLOW_EMPTY_SOURCE \
-            PRESERVE_PERMS MODIFY_WINDOW COOLDOWN_HOURS COPY_LINKS)
-        [ -n "$_unknown" ] && die 78 "unknown key(s) in options.txt: $(echo $_unknown)"
-        SSH_PORT=$(config_get "$_cfg/options.txt" SSH_PORT)
-        BWLIMIT=$(config_get "$_cfg/options.txt" BWLIMIT)
-        TIMEOUT=$(config_get "$_cfg/options.txt" TIMEOUT)
-        EXTRA_FLAGS=$(config_get "$_cfg/options.txt" EXTRA_FLAGS)
-        ALLOW_EMPTY_SOURCE=$(config_get "$_cfg/options.txt" ALLOW_EMPTY_SOURCE)
-        PRESERVE_PERMS=$(config_get "$_cfg/options.txt" PRESERVE_PERMS)
-        MODIFY_WINDOW=$(config_get "$_cfg/options.txt" MODIFY_WINDOW)
-        COOLDOWN_HOURS=$(config_get "$_cfg/options.txt" COOLDOWN_HOURS)
-        COPY_LINKS=$(config_get "$_cfg/options.txt" COPY_LINKS)
-    fi
-    [ -n "$TIMEOUT" ] || TIMEOUT=600
-    case $TIMEOUT in *[!0-9]*) die 78 "TIMEOUT must be a number, got: $TIMEOUT" ;; esac
-    [ -n "$BWLIMIT" ] && { case $BWLIMIT in *[!0-9]*) die 78 "BWLIMIT must be a number, got: $BWLIMIT" ;; esac; }
-    [ -n "$SSH_PORT" ] && { case $SSH_PORT in *[!0-9]*) die 78 "SSH_PORT must be a number, got: $SSH_PORT" ;; esac; }
-    [ -n "$MODIFY_WINDOW" ] && { case $MODIFY_WINDOW in *[!0-9]*) die 78 "MODIFY_WINDOW must be a number, got: $MODIFY_WINDOW" ;; esac; }
-    [ -n "$COOLDOWN_HOURS" ] && { case $COOLDOWN_HOURS in *[!0-9]*) die 78 "COOLDOWN_HOURS must be a number, got: $COOLDOWN_HOURS" ;; esac; }
-
-    case $DEST_TYPE in
-        ssh)
-            [ -n "$DEST_HOST" ] || die 78 "HOST is not set in $_cfg/destination.txt"
-            [ -n "$DEST_PATH" ] || die 78 "DEST_PATH is not set in $_cfg/destination.txt"
-            if [ -n "$DEST_USER" ]; then
-                REMOTE="$DEST_USER@$DEST_HOST"
-            else
-                REMOTE="$DEST_HOST"
-            fi
-            DEST="$REMOTE:$DEST_PATH/"
-            ;;
-        local)
-            # A half-edited config is a misconfiguration, not something to
-            # silently ignore.
-            [ -z "$DEST_HOST" ]  || die 78 "DEST_TYPE=local but HOST is set in $_cfg/destination.txt"
-            [ -z "$DEST_USER" ]  || die 78 "DEST_TYPE=local but USER is set in $_cfg/destination.txt"
-            [ -z "$RSYNC_PATH" ] || die 78 "DEST_TYPE=local but RSYNC_PATH is set in $_cfg/destination.txt"
-            [ -n "$VOLUME_ROOT" ] || die 78 "DEST_TYPE=local requires VOLUME_ROOT in $_cfg/destination.txt"
-            [ -n "$DEST_PATH" ] || die 78 "DEST_PATH is not set in $_cfg/destination.txt"
-            # Absolute is not tidiness. rsync parses a path whose first colon
-            # precedes the first slash as host:path, so a relative DEST_PATH on
-            # a filesystem that permits ':' becomes a silent SSH attempt.
-            case $DEST_PATH in /*) ;; *) die 78 "DEST_TYPE=local requires an ABSOLUTE DEST_PATH, got: $DEST_PATH" ;; esac
-            case $VOLUME_ROOT in /*) ;; *) die 78 "VOLUME_ROOT must be absolute, got: $VOLUME_ROOT" ;; esac
-            VOLUME_ROOT=$(resolve_path "$VOLUME_ROOT")
-            DEST_PATH=$(resolve_path "$DEST_PATH")
-            # Writing outside the removable volume is the failure this whole
-            # feature must not have: it would fill the system disk instead.
-            case "$DEST_PATH/" in
-                "$VOLUME_ROOT"/*) ;;
-                *) die 78 "DEST_PATH ($DEST_PATH) must be inside VOLUME_ROOT ($VOLUME_ROOT)" ;;
-            esac
-            REMOTE=''
-            DEST="$DEST_PATH/"
-            ;;
-        *) die 78 "DEST_TYPE must be 'ssh' or 'local', got: $DEST_TYPE" ;;
-    esac
-
-    # --- rsync ------------------------------------------------------------
-    detect_rsync || die 69 "no rsync found on PATH"
-    log "rsync    : $RSYNC_BIN ($RSYNC_FLAVOUR)"
-    if [ "$RSYNC_FLAVOUR" = openrsync ]; then
-        case $EXTRA_FLAGS in
-            *--iconv*|*--info=*)
-                die 69 "EXTRA_FLAGS uses a flag openrsync does not support. Run: brew install rsync"
-                ;;
-        esac
-    fi
-
-    log "source   : $SRC"
-    log "dest     : $DEST"
-    log "lands as : $DEST${SRC##*/}/"
-
-    # Checked on EVERY local run, not just triggered ones. A manual run with the
-    # drive unplugged is the same catastrophe: rsync would create the mount-point
-    # directory on the system disk and quietly fill it.
-    if [ "$DEST_TYPE" = local ]; then
-        assert_volume_ready "$VOLUME_ROOT"
-        log "volume   : $VOLUME_ROOT mounted, marker present${DEST_FS:+ ($DEST_FS)}"
-        log "free     : $(df -Pk -- "$VOLUME_ROOT" 2>/dev/null | awk 'NR==2{printf "%.1f GB", $4/1048576}')"
-    fi
-    log ""
-
-    check_source_readable "$SRC" "$ALLOW_EMPTY_SOURCE"
-
-    if [ -n "$PREFLIGHT_ONLY" ]; then
-        log ""
-        log "RESULT: PREFLIGHT OK (no transfer attempted)"
-        exit 0
-    fi
-
-    # --- lock -------------------------------------------------------------
-    if ! acquire_lock "$BACKUP_NAME"; then
-        log ""
-        log "RESULT: SKIPPED -- another run of '$BACKUP_NAME' is already in progress."
-        # An overlap is a normal condition, not an error worth mailing about.
-        exit 0
-    fi
-
-    # --- flags ------------------------------------------------------------
+# _rsync_assemble_args -- the rsync side of argv assembly. Moved verbatim out
+# of run_backup when the rclone transport arrived, so the two assemblies are
+# named, symmetrical things rather than one branch nested inside the other.
+_rsync_assemble_args() {
     # -a is -Dgloprt. --no-o --no-g must follow it (later wins) and are a hard
     # rule: chown only works when the receiver runs as root, so over a normal
     # SSH login it was silently failing anyway. --no-D is here for the same
@@ -1109,6 +927,350 @@ run_backup() {
         esac
     fi
 
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# The main entry point. Every generated runner calls this and nothing else.
+# ---------------------------------------------------------------------------
+run_backup() {
+    BACKUP_NAME=$1
+    shift
+
+    DRY_RUN=''
+    FROM_CRON=''
+    PREFLIGHT_ONLY=''
+    ON_MOUNT=''
+    PRUNE=''
+    PRUNE_CONFIRMED=''
+    PRUNE_ACTIVE=''
+    while [ $# -gt 0 ]; do
+        case $1 in
+            --dry-run|-n) DRY_RUN=1 ;;
+            --cron) FROM_CRON=1 ;;
+            --preflight) PREFLIGHT_ONLY=1 ;;
+            --on-mount) ON_MOUNT=1 ;;
+            --sync-deletions) PRUNE=1 ;;
+            *) die 64 "unknown argument: $1 (accepts --dry-run, --preflight, --cron, --on-mount, --sync-deletions)" ;;
+        esac
+        shift
+    done
+
+    # --sync-deletions is the ONLY sanctioned path to deletion, and it is manual by
+    # construction. The cron/on-mount bans are unconditional -- no environment
+    # variable lifts them. The terminal check covers BOTH ends: a piped stdin
+    # cannot answer the prompt, and a redirected stdout would leave `read`
+    # blocked invisibly while holding the lock. RBS_TEST_CONFIRM_STDIN is the
+    # test seam for the TTY check alone, and it is honoured only when rsync is
+    # the stub (RSYNC_BIN_OVERRIDE) -- on the real binary it is inert, so the
+    # confirmation cannot be scripted or scheduled around.
+    if [ -n "$PRUNE" ]; then
+        [ -n "$FROM_CRON" ] && die 78 "--sync-deletions is refused on scheduled runs: deletion requires an interactive confirmation"
+        [ -n "$ON_MOUNT" ]  && die 78 "--sync-deletions is refused on drive-connect runs: deletion requires an interactive confirmation"
+        # The seam is keyed on the override for the transport this backup
+        # actually uses -- never on "either one is set". OR-ing them would let
+        # a cloud prune be scripted whenever the rsync stub happened to be in
+        # the environment, which is precisely the widening this guards against.
+        # DEST_TYPE is read directly because the full config parse happens
+        # further down, after the log is opened.
+        _seam=''
+        _seam_dt=''
+        [ -f "$REPO_ROOT/config/$BACKUP_NAME/destination.txt" ] \
+            && _seam_dt=$(config_get "$REPO_ROOT/config/$BACKUP_NAME/destination.txt" DEST_TYPE)
+        if [ "$_seam_dt" = cloud ]; then
+            [ -n "${RBS_TEST_CONFIRM_STDIN:-}" ] && [ -n "${RCLONE_BIN_OVERRIDE:-}" ] && _seam=1
+        else
+            [ -n "${RBS_TEST_CONFIRM_STDIN:-}" ] && [ -n "${RSYNC_BIN_OVERRIDE:-}" ] && _seam=1
+        fi
+        if [ -z "$DRY_RUN" ] && [ -z "$PREFLIGHT_ONLY" ] && [ -z "$_seam" ] \
+           && { [ ! -t 0 ] || [ ! -t 1 ]; }; then
+            die 78 "--sync-deletions needs a terminal on stdin and stdout to ask for confirmation"
+        fi
+    fi
+
+    # The mount gate runs BEFORE the log is opened, and is the only thing that
+    # does. A drive-connect trigger fires on every volume mount on the machine,
+    # so the common case must cost one stat and leave no trace.
+    if [ -n "$ON_MOUNT" ]; then
+        mount_gate "$BACKUP_NAME" "$REPO_ROOT/config/$BACKUP_NAME" || exit 0
+    fi
+
+    # The log is opened FIRST, before config is validated. The crontab line
+    # redirects to a bootstrap file, so a config error that died before the log
+    # existed would otherwise be completely silent under cron.
+    open_log "$BACKUP_NAME"
+    trap _on_exit EXIT
+    trap _on_signal INT TERM HUP
+
+    _cfg=$REPO_ROOT/config/$BACKUP_NAME
+    log "=============================================================="
+    log "backup   : $BACKUP_NAME"
+    log "started  : $(date '+%Y-%m-%d %H:%M:%S %z')"
+    log "host     : $(hostname 2>/dev/null || echo unknown)"
+    if [ -n "$ON_MOUNT" ]; then _how=drive-connect
+    elif [ -n "$FROM_CRON" ]; then _how=cron
+    else _how=manual; fi
+    log "invoked  : $_how$([ -n "$DRY_RUN" ] && echo ' (dry run)')"
+    log "=============================================================="
+
+    # --- config -----------------------------------------------------------
+    [ -d "$_cfg" ] || die 78 "no configuration for '$BACKUP_NAME'. Run ./setup.sh to create it. (looked in $_cfg)"
+    for _f in source.txt destination.txt; do
+        [ -f "$_cfg/$_f" ] || die 78 "missing $_cfg/$_f. Run ./setup.sh to recreate it."
+    done
+
+    _raw_src=$(config_first_line "$_cfg/source.txt") \
+        || die 78 "$_cfg/source.txt is empty. Run ./setup.sh."
+    SRC=$(resolve_path "$_raw_src")
+
+    DEST_USER=$(config_get "$_cfg/destination.txt" USER)
+    DEST_HOST=$(config_get "$_cfg/destination.txt" HOST)
+    DEST_PATH=$(config_get "$_cfg/destination.txt" DEST_PATH)
+    RSYNC_PATH=$(config_get "$_cfg/destination.txt" RSYNC_PATH)
+    # An EXPLICIT key, never inferred from an empty HOST: destination.txt is
+    # hand-editable, and a HOST line blanked by accident must not silently turn
+    # an SSH backup into one that writes into $HOME. Absent == ssh == the
+    # behaviour every existing config already has.
+    DEST_TYPE=$(config_get "$_cfg/destination.txt" DEST_TYPE)
+    VOLUME_ROOT=$(config_get "$_cfg/destination.txt" VOLUME_ROOT)
+    DEST_FS=$(config_get "$_cfg/destination.txt" DEST_FS)
+    # Cloud destinations. RCLONE_REMOTE names a remote in the user's
+    # ~/.config/rclone/rclone.conf -- it is NEVER a credential, and no key or
+    # token ever enters this repo's config tree.
+    RCLONE_REMOTE=$(config_get "$_cfg/destination.txt" RCLONE_REMOTE)
+    CLOUD_PROVIDER=$(config_get "$_cfg/destination.txt" CLOUD_PROVIDER)
+    RCLONE_CONFIG_PATH=$(config_get "$_cfg/destination.txt" RCLONE_CONFIG_PATH)
+    [ -n "$DEST_TYPE" ] || DEST_TYPE=ssh
+
+    _unknown=$(config_unknown_keys "$_cfg/destination.txt" \
+        USER HOST DEST_PATH RSYNC_PATH DEST_TYPE VOLUME_ROOT DEST_FS \
+        RCLONE_REMOTE CLOUD_PROVIDER RCLONE_CONFIG_PATH)
+    [ -n "$_unknown" ] && die 78 "unknown key(s) in destination.txt: $(echo $_unknown)"
+
+    # Every one of these must be initialised BEFORE use: `set -u` makes an unset
+    # variable a fatal error, so a key that only some backups set would crash
+    # every backup that does not set it.
+    SSH_PORT=''; BWLIMIT=''; TIMEOUT=''; EXTRA_FLAGS=''; ALLOW_EMPTY_SOURCE=''
+    PRESERVE_PERMS=''; MODIFY_WINDOW=''; COOLDOWN_HOURS=''; COPY_LINKS=''
+    # A SEPARATE flag key per transport, deliberately: rsync's flags and
+    # rclone's are different languages, and one shared key would let an rsync
+    # flag list reach rclone (or the reverse) on a config that changed kind.
+    # Each is rejected outright on the other transport, below.
+    RCLONE_TRANSFERS=''; RCLONE_CHECKERS=''; RCLONE_EXTRA_FLAGS=''
+    if [ -f "$_cfg/options.txt" ]; then
+        _unknown=$(config_unknown_keys "$_cfg/options.txt" \
+            SSH_PORT BWLIMIT TIMEOUT EXTRA_FLAGS ALLOW_EMPTY_SOURCE \
+            PRESERVE_PERMS MODIFY_WINDOW COOLDOWN_HOURS COPY_LINKS \
+            RCLONE_TRANSFERS RCLONE_CHECKERS RCLONE_EXTRA_FLAGS)
+        [ -n "$_unknown" ] && die 78 "unknown key(s) in options.txt: $(echo $_unknown)"
+        SSH_PORT=$(config_get "$_cfg/options.txt" SSH_PORT)
+        BWLIMIT=$(config_get "$_cfg/options.txt" BWLIMIT)
+        TIMEOUT=$(config_get "$_cfg/options.txt" TIMEOUT)
+        EXTRA_FLAGS=$(config_get "$_cfg/options.txt" EXTRA_FLAGS)
+        ALLOW_EMPTY_SOURCE=$(config_get "$_cfg/options.txt" ALLOW_EMPTY_SOURCE)
+        PRESERVE_PERMS=$(config_get "$_cfg/options.txt" PRESERVE_PERMS)
+        MODIFY_WINDOW=$(config_get "$_cfg/options.txt" MODIFY_WINDOW)
+        COOLDOWN_HOURS=$(config_get "$_cfg/options.txt" COOLDOWN_HOURS)
+        COPY_LINKS=$(config_get "$_cfg/options.txt" COPY_LINKS)
+        RCLONE_TRANSFERS=$(config_get "$_cfg/options.txt" RCLONE_TRANSFERS)
+        RCLONE_CHECKERS=$(config_get "$_cfg/options.txt" RCLONE_CHECKERS)
+        RCLONE_EXTRA_FLAGS=$(config_get "$_cfg/options.txt" RCLONE_EXTRA_FLAGS)
+    fi
+    [ -n "$TIMEOUT" ] || TIMEOUT=600
+    case $TIMEOUT in *[!0-9]*) die 78 "TIMEOUT must be a number, got: $TIMEOUT" ;; esac
+    [ -n "$BWLIMIT" ] && { case $BWLIMIT in *[!0-9]*) die 78 "BWLIMIT must be a number, got: $BWLIMIT" ;; esac; }
+    [ -n "$SSH_PORT" ] && { case $SSH_PORT in *[!0-9]*) die 78 "SSH_PORT must be a number, got: $SSH_PORT" ;; esac; }
+    [ -n "$MODIFY_WINDOW" ] && { case $MODIFY_WINDOW in *[!0-9]*) die 78 "MODIFY_WINDOW must be a number, got: $MODIFY_WINDOW" ;; esac; }
+    [ -n "$COOLDOWN_HOURS" ] && { case $COOLDOWN_HOURS in *[!0-9]*) die 78 "COOLDOWN_HOURS must be a number, got: $COOLDOWN_HOURS" ;; esac; }
+    [ -n "$RCLONE_TRANSFERS" ] && { case $RCLONE_TRANSFERS in *[!0-9]*) die 78 "RCLONE_TRANSFERS must be a number, got: $RCLONE_TRANSFERS" ;; esac; }
+    [ -n "$RCLONE_CHECKERS" ] && { case $RCLONE_CHECKERS in *[!0-9]*) die 78 "RCLONE_CHECKERS must be a number, got: $RCLONE_CHECKERS" ;; esac; }
+
+    # The transport is DERIVED from DEST_TYPE and never configured directly:
+    # ssh and local are both rsync, cloud is rclone. Everything downstream that
+    # differs between the two forks on $TRANSPORT, not on $DEST_TYPE.
+    case $DEST_TYPE in
+        cloud) TRANSPORT=rclone ;;
+        *)     TRANSPORT=rsync ;;
+    esac
+    if [ "$TRANSPORT" = rclone ]; then
+        # A soft-sourced lib/cloud.sh means a half-updated engine home still
+        # runs every rsync backup normally instead of failing all of them.
+        command -v _rclone_build_filter >/dev/null 2>&1 \
+            || die 78 "this engine has no cloud support (lib/cloud.sh is missing) -- update Rsyncronizer"
+        [ -z "$EXTRA_FLAGS" ] \
+            || die 78 "EXTRA_FLAGS holds rsync flags and is refused on a cloud backup. Use RCLONE_EXTRA_FLAGS in $_cfg/options.txt"
+    else
+        [ -z "$RCLONE_EXTRA_FLAGS" ] \
+            || die 78 "RCLONE_EXTRA_FLAGS applies only to DEST_TYPE=cloud. Use EXTRA_FLAGS in $_cfg/options.txt"
+        [ -z "$RCLONE_TRANSFERS" ] || die 78 "RCLONE_TRANSFERS applies only to DEST_TYPE=cloud"
+        [ -z "$RCLONE_CHECKERS" ]  || die 78 "RCLONE_CHECKERS applies only to DEST_TYPE=cloud"
+        [ -z "$RCLONE_REMOTE" ] \
+            || die 78 "DEST_TYPE=$DEST_TYPE but RCLONE_REMOTE is set in $_cfg/destination.txt"
+        [ -z "$CLOUD_PROVIDER" ] \
+            || die 78 "DEST_TYPE=$DEST_TYPE but CLOUD_PROVIDER is set in $_cfg/destination.txt"
+        [ -z "$RCLONE_CONFIG_PATH" ] \
+            || die 78 "DEST_TYPE=$DEST_TYPE but RCLONE_CONFIG_PATH is set in $_cfg/destination.txt"
+    fi
+
+    case $DEST_TYPE in
+        ssh)
+            [ -n "$DEST_HOST" ] || die 78 "HOST is not set in $_cfg/destination.txt"
+            [ -n "$DEST_PATH" ] || die 78 "DEST_PATH is not set in $_cfg/destination.txt"
+            if [ -n "$DEST_USER" ]; then
+                REMOTE="$DEST_USER@$DEST_HOST"
+            else
+                REMOTE="$DEST_HOST"
+            fi
+            DEST="$REMOTE:$DEST_PATH/"
+            LANDING="$DEST${SRC##*/}/"
+            ;;
+        local)
+            # A half-edited config is a misconfiguration, not something to
+            # silently ignore.
+            [ -z "$DEST_HOST" ]  || die 78 "DEST_TYPE=local but HOST is set in $_cfg/destination.txt"
+            [ -z "$DEST_USER" ]  || die 78 "DEST_TYPE=local but USER is set in $_cfg/destination.txt"
+            [ -z "$RSYNC_PATH" ] || die 78 "DEST_TYPE=local but RSYNC_PATH is set in $_cfg/destination.txt"
+            [ -n "$VOLUME_ROOT" ] || die 78 "DEST_TYPE=local requires VOLUME_ROOT in $_cfg/destination.txt"
+            [ -n "$DEST_PATH" ] || die 78 "DEST_PATH is not set in $_cfg/destination.txt"
+            # Absolute is not tidiness. rsync parses a path whose first colon
+            # precedes the first slash as host:path, so a relative DEST_PATH on
+            # a filesystem that permits ':' becomes a silent SSH attempt.
+            case $DEST_PATH in /*) ;; *) die 78 "DEST_TYPE=local requires an ABSOLUTE DEST_PATH, got: $DEST_PATH" ;; esac
+            case $VOLUME_ROOT in /*) ;; *) die 78 "VOLUME_ROOT must be absolute, got: $VOLUME_ROOT" ;; esac
+            VOLUME_ROOT=$(resolve_path "$VOLUME_ROOT")
+            DEST_PATH=$(resolve_path "$DEST_PATH")
+            # Writing outside the removable volume is the failure this whole
+            # feature must not have: it would fill the system disk instead.
+            case "$DEST_PATH/" in
+                "$VOLUME_ROOT"/*) ;;
+                *) die 78 "DEST_PATH ($DEST_PATH) must be inside VOLUME_ROOT ($VOLUME_ROOT)" ;;
+            esac
+            REMOTE=''
+            DEST="$DEST_PATH/"
+            LANDING="$DEST${SRC##*/}/"
+            ;;
+        cloud)
+            # A half-edited config is a misconfiguration, not something to
+            # silently ignore -- the same rule the local branch above follows.
+            [ -z "$DEST_HOST" ]   || die 78 "DEST_TYPE=cloud but HOST is set in $_cfg/destination.txt"
+            [ -z "$DEST_USER" ]   || die 78 "DEST_TYPE=cloud but USER is set in $_cfg/destination.txt"
+            [ -z "$RSYNC_PATH" ]  || die 78 "DEST_TYPE=cloud but RSYNC_PATH is set in $_cfg/destination.txt"
+            [ -z "$VOLUME_ROOT" ] || die 78 "DEST_TYPE=cloud but VOLUME_ROOT is set in $_cfg/destination.txt"
+            [ -z "$DEST_FS" ]     || die 78 "DEST_TYPE=cloud but DEST_FS is set in $_cfg/destination.txt"
+
+            [ -n "$RCLONE_REMOTE" ] \
+                || die 78 "RCLONE_REMOTE is not set in $_cfg/destination.txt. List your remotes with: rclone listremotes"
+            # A remote name carrying ':' or '/' would silently re-point the
+            # destination once it is interpolated into 'remote:path'.
+            case $RCLONE_REMOTE in
+                ''|[!A-Za-z0-9]*|*[!A-Za-z0-9._-]*)
+                    die 78 "RCLONE_REMOTE must be an rclone remote name (letters, digits, . _ -), without the ':' -- got: $RCLONE_REMOTE" ;;
+            esac
+
+            [ -n "$DEST_PATH" ] || die 78 "DEST_PATH is not set in $_cfg/destination.txt"
+            case $DEST_PATH in
+                -*)  die 78 "DEST_PATH may not begin with '-', got: $DEST_PATH" ;;
+                /*)  die 78 "DEST_TYPE=cloud needs a path INSIDE the remote, with no leading '/', got: $DEST_PATH" ;;
+                *:*) die 78 "DEST_PATH may not contain ':' -- the remote is named by RCLONE_REMOTE. Got: $DEST_PATH" ;;
+            esac
+            # NOT resolve_path: that prefixes $HOME to anything not absolute,
+            # and 'Backups/laptop' is exactly that shape. Silently backing up
+            # to ~/Backups/laptop instead of the cloud is what this avoids.
+            DEST_PATH=$(_cloud_path_norm "$DEST_PATH")
+            [ -n "$DEST_PATH" ] || die 78 "DEST_PATH is empty in $_cfg/destination.txt"
+
+            case ${CLOUD_PROVIDER:-} in
+                ''|s3|drive|onedrive|dropbox|other) ;;
+                *) die 78 "CLOUD_PROVIDER must be s3, drive, onedrive, dropbox or other -- got: $CLOUD_PROVIDER" ;;
+            esac
+            if [ -n "$RCLONE_CONFIG_PATH" ]; then
+                RCLONE_CONFIG_PATH=$(resolve_path "$RCLONE_CONFIG_PATH")
+                [ -f "$RCLONE_CONFIG_PATH" ] \
+                    || die 78 "RCLONE_CONFIG_PATH does not exist: $RCLONE_CONFIG_PATH"
+            fi
+
+            REMOTE=''
+            # `rclone copy SRC DST` copies the CONTENTS of SRC into DST, so the
+            # copy-by-name rule needs the basename appended HERE. Without it
+            # ~/Documents lands as <dest>/ rather than <dest>/Documents/ -- the
+            # same trap rsync's trailing slash sets, in a different disguise.
+            #
+            # The prune check runs against this exact string too. Pointed one
+            # level up it would report every SIBLING backup under DEST_PATH as
+            # missing-at-source, and a confirmed prune would then delete them.
+            DEST="$RCLONE_REMOTE:$DEST_PATH/${SRC##*/}"
+            LANDING="$DEST/"
+            ;;
+        *) die 78 "DEST_TYPE must be 'ssh', 'local' or 'cloud', got: $DEST_TYPE" ;;
+    esac
+
+    # --- transport --------------------------------------------------------
+    if [ "$TRANSPORT" = rclone ]; then
+        if ! detect_rclone; then
+            rclone_install_hint | while IFS= read -r _rh; do log "  $_rh"; done
+            die 69 "no rclone found -- cloud destinations need it (SSH and drive backups are unaffected)"
+        fi
+        # A version we cannot parse is not a safety problem, so it warns rather
+        # than blocking the backup.
+        if [ "$RCLONE_VERSION" = unknown ]; then
+            log "rclone   : $RCLONE_BIN (version string not recognised -- proceeding)"
+        elif _rclone_version_ge "$RCLONE_VERSION" "$RBS_RCLONE_MIN"; then
+            log "rclone   : $RCLONE_BIN ($RCLONE_VERSION)"
+        else
+            die 69 "rclone $RCLONE_VERSION is older than $RBS_RCLONE_MIN, which this needs. Upgrade it: brew install rclone / sudo apt install rclone"
+        fi
+        XFER_BIN=$RCLONE_BIN
+        log "provider : ${CLOUD_PROVIDER:-unspecified}, remote '$RCLONE_REMOTE:'"
+    else
+        detect_rsync || die 69 "no rsync found on PATH"
+        XFER_BIN=$RSYNC_BIN
+        log "rsync    : $RSYNC_BIN ($RSYNC_FLAVOUR)"
+        if [ "$RSYNC_FLAVOUR" = openrsync ]; then
+            case $EXTRA_FLAGS in
+                *--iconv*|*--info=*)
+                    die 69 "EXTRA_FLAGS uses a flag openrsync does not support. Run: brew install rsync"
+                    ;;
+            esac
+        fi
+    fi
+
+    log "source   : $SRC"
+    log "dest     : $DEST"
+    log "lands as : $LANDING"
+
+    # Checked on EVERY local run, not just triggered ones. A manual run with the
+    # drive unplugged is the same catastrophe: rsync would create the mount-point
+    # directory on the system disk and quietly fill it.
+    if [ "$DEST_TYPE" = local ]; then
+        assert_volume_ready "$VOLUME_ROOT"
+        log "volume   : $VOLUME_ROOT mounted, marker present${DEST_FS:+ ($DEST_FS)}"
+        log "free     : $(df -Pk -- "$VOLUME_ROOT" 2>/dev/null | awk 'NR==2{printf "%.1f GB", $4/1048576}')"
+    fi
+    log ""
+
+    check_source_readable "$SRC" "$ALLOW_EMPTY_SOURCE"
+
+    if [ -n "$PREFLIGHT_ONLY" ]; then
+        log ""
+        log "RESULT: PREFLIGHT OK (no transfer attempted)"
+        exit 0
+    fi
+
+    # --- lock -------------------------------------------------------------
+    if ! acquire_lock "$BACKUP_NAME"; then
+        log ""
+        log "RESULT: SKIPPED -- another run of '$BACKUP_NAME' is already in progress."
+        # An overlap is a normal condition, not an error worth mailing about.
+        exit 0
+    fi
+
+    # --- flags ------------------------------------------------------------
+    if [ "$TRANSPORT" = rclone ]; then
+        _rclone_assemble_args
+    else
+        _rsync_assemble_args
+    fi
+
     # Paths are appended AFTER the guard, and validated separately so neither
     # can be mistaken for a flag.
     case $SRC in -*) die 78 "source path may not begin with '-'" ;; esac
@@ -1118,10 +1280,31 @@ run_backup() {
     # This block sits INSIDE the lock, so a scheduled run arriving while the
     # prompt is open exits 0 SKIPPED instead of racing the deletion.
     if [ -n "$PRUNE" ] && [ -n "$DRY_RUN" ]; then
-        # The dry run IS the preview; no prompt, nothing happens.
-        assert_prune_sanctioned preview
-        ARGS+=( --delete-after --itemize-changes )
-        log "prune    : DRY RUN -- lines marked '*deleting' would be deleted; nothing happens"
+        if [ "$TRANSPORT" = rclone ]; then
+            # rclone's preview is a separate `check` pass rather than a flag on
+            # the transfer, so the transfer verb stays `copy` and no deleting
+            # verb is ever assembled on a dry run at all.
+            _pv_raw=$LOG_DIR/prune-$(date +%Y-%m-%d_%H%M%S)-preview.log
+            _pv_list=$LOG_DIR/.prune-list-confirmed.txt
+            log "prune    : scanning the destination for entries absent from the source..."
+            _prune_scan "$_pv_raw" "$_pv_list"
+            _pv_n=$(wc -l <"$_pv_list" | tr -d ' ')
+            if [ "$_pv_n" -eq 0 ]; then
+                log "prune    : nothing to prune -- the destination holds no entries absent from the source."
+            else
+                log "prune    : $_pv_n entries exist at the DESTINATION but not at the source"
+                sed 's/^/  will delete: /' "$_pv_list" >>"$LOG_FILE"
+                if [ -t 1 ]; then
+                    head -200 "$_pv_list" | sed 's/^/  will delete: /'
+                fi
+            fi
+            log "prune    : DRY RUN -- the entries above would be deleted; nothing happens"
+        else
+            # The dry run IS the preview; no prompt, nothing happens.
+            assert_prune_sanctioned preview
+            ARGS+=( --delete-after --itemize-changes )
+            log "prune    : DRY RUN -- lines marked '*deleting' would be deleted; nothing happens"
+        fi
     elif [ -n "$PRUNE" ]; then
         # Preview: raw itemized output goes to its own prune-<ts>-preview.log
         # audit file (its own ring, see _prune_scan), NOT into the main log --
@@ -1180,13 +1363,39 @@ run_backup() {
             fi
             PRUNE_CONFIRMED=1
             assert_prune_sanctioned real
-            ARGS+=( --delete-after --itemize-changes )
+            if [ "$TRANSPORT" = rclone ]; then
+                # The VERB is the deletion switch, and _rclone_transfer_args is
+                # the one site in the codebase that can produce `sync`.
+                # assert_no_destructive_rclone_flags re-proves the sanction from
+                # the verb itself, and --delete-after/--max-delete are on its
+                # blacklist, so they are appended AFTER it -- the same pattern
+                # as rsync's --delete-after below.
+                #
+                # --max-delete pins the confirmed count: a third line of defence
+                # behind the typed phrase and the recheck. If rclone somehow
+                # decides to remove more than was agreed, it stops fatally.
+                _rclone_transfer_args sync
+                assert_no_destructive_rclone_flags ${ARGS[@]+"${ARGS[@]}"}
+                ARGS+=( --delete-after --max-delete="$_pv_n" )
+                [ -n "$RCLONE_CONFIG_PATH" ] && ARGS+=( --config="$RCLONE_CONFIG_PATH" )
+            else
+                ARGS+=( --delete-after --itemize-changes )
+            fi
             PRUNE_ACTIVE=1
-            log "prune    : confirmed; --delete-after enabled for this run"
+            # Transport-neutral on purpose. The desktop app watches for this
+            # exact line to advance its staged dialog, and it has to mean the
+            # same thing on both transports. The mechanism goes on the NEXT
+            # line, which nothing classifies.
+            log "prune    : deletions confirmed and re-verified"
+            if [ "$TRANSPORT" = rclone ]; then
+                log "prune    : rclone sync --delete-after --max-delete=$_pv_n enabled for this run"
+            else
+                log "prune    : rsync --delete-after enabled for this run"
+            fi
         fi
     fi
 
-    log "command  : $RSYNC_BIN ${ARGS[*]} <source> <dest>"
+    log "command  : $XFER_BIN ${ARGS[*]} <source> <dest>"
     # Only set for ssh destinations; a local one has no remote shell at all.
     [ -n "${RSYNC_RSH:-}" ] && log "RSYNC_RSH: $RSYNC_RSH"
     log "--------------------------------------------------------------"
@@ -1194,10 +1403,10 @@ run_backup() {
     # --- run --------------------------------------------------------------
     _start=$(date +%s)
     if [ -t 1 ]; then
-        "$RSYNC_BIN" ${ARGS[@]+"${ARGS[@]}"} "$SRC" "$DEST" 2>&1 | tee -a "$LOG_FILE"
+        "$XFER_BIN" ${ARGS[@]+"${ARGS[@]}"} "$SRC" "$DEST" 2>&1 | tee -a "$LOG_FILE"
         RC=${PIPESTATUS[0]}
     else
-        "$RSYNC_BIN" ${ARGS[@]+"${ARGS[@]}"} "$SRC" "$DEST" >>"$LOG_FILE" 2>&1
+        "$XFER_BIN" ${ARGS[@]+"${ARGS[@]}"} "$SRC" "$DEST" >>"$LOG_FILE" 2>&1
         RC=$?
     fi
     _end=$(date +%s)
@@ -1205,17 +1414,40 @@ run_backup() {
 
     log "--------------------------------------------------------------"
 
-    # Both implementations are covered by one pattern:
-    #   openrsync : "Number of files transferred: N"
-    #   GNU rsync : "Number of regular files transferred: N"
-    _xfer=$(grep -aE '^Number of (regular )?files transferred:' "$LOG_FILE" \
-            | tail -1 | tr -dc '0-9')
-    [ -n "$_xfer" ] || _xfer='?'
-    # Total files considered, for the GUI's context line. GNU writes
-    # "Number of files: 1,416 (reg: ...)"; openrsync "Number of files: 1416" --
-    # cut at '(' first, or the parenthetical digits would concatenate in.
-    _total=$(grep -a '^Number of files:' "$LOG_FILE" | tail -1 \
-             | sed 's/(.*//' | tr -dc '0-9')
+    if [ "$TRANSPORT" = rclone ]; then
+        # rclone's summary carries TWO 'Transferred:' lines -- bytes first,
+        # then the file count -- so the pattern must demand the bare-integer
+        # form or a naive tail -1 mashes the two together. tests/fake-rclone
+        # emits both, in rclone's order, to keep this honest.
+        #   Transferred:   	   12.345 MiB / 12.345 MiB, 100%, 1.2 MiB/s, ETA 0s
+        #   Checks:                 100 / 100, 100%
+        #   Transferred:             42 / 42, 100%
+        _xfer=$(grep -aE 'Transferred:[[:space:]]+[0-9]+ / [0-9]+,' "$LOG_FILE" \
+                | tail -1 | sed -e 's/.*Transferred:[[:space:]]*//' -e 's| /.*||' | tr -dc '0-9')
+        [ -n "$_xfer" ] || _xfer='?'
+        _checked=$(grep -aE 'Checks:[[:space:]]+[0-9]+ / [0-9]+,' "$LOG_FILE" \
+                   | tail -1 | sed -e 's/.*Checks:[[:space:]]*//' -e 's| /.*||' | tr -dc '0-9')
+        # "Total files considered" is checks plus transfers: rclone counts a
+        # file it had to upload as a transfer, not as a check.
+        _total=''
+        case ${_checked:-}${_xfer} in
+            *[!0-9]*) ;;
+            '') ;;
+            *) [ -n "$_checked" ] && _total=$((_checked + _xfer)) ;;
+        esac
+    else
+        # Both implementations are covered by one pattern:
+        #   openrsync : "Number of files transferred: N"
+        #   GNU rsync : "Number of regular files transferred: N"
+        _xfer=$(grep -aE '^Number of (regular )?files transferred:' "$LOG_FILE" \
+                | tail -1 | tr -dc '0-9')
+        [ -n "$_xfer" ] || _xfer='?'
+        # Total files considered, for the GUI's context line. GNU writes
+        # "Number of files: 1,416 (reg: ...)"; openrsync "Number of files: 1416" --
+        # cut at '(' first, or the parenthetical digits would concatenate in.
+        _total=$(grep -a '^Number of files:' "$LOG_FILE" | tail -1 \
+                 | sed 's/(.*//' | tr -dc '0-9')
+    fi
 
     log "finished : $(date '+%Y-%m-%d %H:%M:%S %z')  (${_elapsed}s)"
     log "files transferred: $_xfer"
@@ -1223,7 +1455,14 @@ run_backup() {
     # in the main log, so every '^*deleting' line here is a real deletion.
     _deleted=''
     if [ -n "$PRUNE_ACTIVE" ]; then
-        _deleted=$(grep -c '^\*deleting' "$LOG_FILE" 2>/dev/null)
+        if [ "$TRANSPORT" = rclone ]; then
+            # 'Deleted:  3 (files), 0 (dirs)' in the stats block.
+            _deleted=$(grep -aE 'Deleted:[[:space:]]+[0-9]+' "$LOG_FILE" | tail -1 \
+                       | sed -e 's/.*Deleted:[[:space:]]*//' -e 's/[^0-9].*//')
+            [ -n "$_deleted" ] || _deleted=0
+        else
+            _deleted=$(grep -c '^\*deleting' "$LOG_FILE" 2>/dev/null)
+        fi
         log "entries deleted at destination: $_deleted"
     fi
     interpret_exit "$RC"
@@ -1234,6 +1473,11 @@ run_backup() {
         echo "EPOCH=$_end"
         echo "WHEN=$(date '+%Y-%m-%d %H:%M:%S')"
         echo "RC=$RC"
+        # Written ONLY for rclone, so every last-run.txt already in the field
+        # keeps its exact meaning and an absent key reads as rsync. rclone's
+        # exit codes collide with rsync's, and status.sh picks its verdict
+        # table from this line.
+        [ "$TRANSPORT" = rclone ] && echo "TRANSPORT=rclone"
         echo "FILES=$_xfer"
         [ -n "$_total" ] && echo "TOTAL_FILES=$_total"
         echo "ELAPSED=$_elapsed"
@@ -1279,3 +1523,18 @@ run_backup() {
     release_lock
     exit "$RC"
 }
+
+# ---------------------------------------------------------------------------
+# The rclone transport, for DEST_TYPE=cloud.
+#
+# Sourced SOFTLY and last. A hard `.` would make every backup on a
+# partially-updated engine home fail, including the rsync ones that need
+# nothing from it; instead the cloud branch of run_backup checks for one of its
+# functions and dies 78 with an actionable message. Nothing above this line
+# depends on it.
+# ---------------------------------------------------------------------------
+# An `if` rather than `[ ... ] && .` so that a missing cloud.sh does not make
+# the enclosing `source lib/common.sh` itself return non-zero.
+if [ -f "${REPO_ROOT:-}/lib/cloud.sh" ]; then
+    . "$REPO_ROOT/lib/cloud.sh"
+fi

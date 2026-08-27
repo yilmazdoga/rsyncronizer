@@ -13,8 +13,11 @@ scripts the terminal user runs. This module only
 
 from __future__ import annotations
 
+import configparser
 import fcntl
+import json
 import os
+import re
 import pty
 import select
 import shutil
@@ -26,20 +29,41 @@ import termios
 APP_DIR_NAME = "rsync-backup-scripts"
 
 
-def engine_files() -> list[str]:
-    """The engine file set, from the single-source manifest.
+def manifest_entry(line: str) -> tuple[str, bool]:
+    """Split a manifest line into (path, required).
+
+    A leading '?' marks an OPTIONAL entry: ship it if it is there, skip it if
+    it is not. It exists for bin/rclone, which is downloaded at build time and
+    so is present in an app bundle but absent from the repo and from the CLI
+    tarball. Keeping it in the manifest is what stops a second, hard-coded
+    copy of the engine file set appearing -- the rule the bash suite enforces.
+    """
+    if line.startswith("?"):
+        return line[1:], False
+    return line, True
+
+
+def engine_manifest() -> list[tuple[str, bool]]:
+    """The engine file set as (path, required) pairs, from the single-source
+    manifest.
 
     User state (config/, backups/, logs/, remotes/) is never in this list and
     never touched by materialization.
     """
     path = os.path.join(resource_root(), "lib", "engine-manifest.txt")
-    files = []
+    entries = []
     with open(path, "r", encoding="utf-8") as fh:
         for line in fh:
             line = line.strip()
             if line and not line.startswith("#"):
-                files.append(line)
-    return files
+                entries.append(manifest_entry(line))
+    return entries
+
+
+def engine_files() -> list[str]:
+    """Just the paths, with the optional marker already stripped, so no caller
+    can mistake '?bin/rclone' for a filename."""
+    return [rel for rel, _ in engine_manifest()]
 
 
 def resource_root() -> str:
@@ -92,12 +116,18 @@ def materialize(force: bool = False) -> str:
     """
     src = resource_root()
     dst = engine_root()
-    for rel in engine_files():
+    for rel, required in engine_manifest():
         s = os.path.join(src, rel)
         d = os.path.join(dst, rel)
+        if not required and not os.path.exists(s):
+            continue
         os.makedirs(os.path.dirname(d), exist_ok=True)
         shutil.copyfile(s, d)
-        if d.endswith(".sh") or os.path.basename(d) == "rsyncronizer":
+        # bin/rclone rides in PyInstaller's datas, not binaries -- a static Go
+        # binary must be copied verbatim rather than run through dependency
+        # analysis -- and datas drops the executable bit.
+        if (d.endswith(".sh")
+                or os.path.basename(d) in ("rsyncronizer", "rclone")):
             os.chmod(d, 0o755)
     ensure_global_exclude(dst)
     return dst
@@ -210,8 +240,277 @@ def check_tools() -> list[str]:
 
 
 # --------------------------------------------------------------------------
+# Cloud destinations (rclone)
+#
+# rclone is OPTIONAL. check_tools() above deliberately does NOT list it: a
+# permanent red banner for a dependency most users never need trains people to
+# ignore banners. It is a problem only for a backup already configured to use
+# it -- see rclone_missing_for_backups().
+# --------------------------------------------------------------------------
+
+CLOUD_TYPES = {
+    "s3": "S3",
+    "drive": "Google Drive",
+    "onedrive": "OneDrive",
+    "dropbox": "Dropbox",
+}
+
+# What will otherwise look like a bug the first time it happens.
+CLOUD_PROVIDER_NOTES = {
+    "s3": ("S3 reports no free-space figure, so the dashboard cannot show one. "
+           "Reading a file's timestamp costs an extra request, so the first "
+           "run is slow."),
+    "drive": ("Google Drive caps uploads at 750 GB per day \u2014 a larger first "
+              "backup continues the next day. Deletions go to Drive's trash, "
+              "not straight to free space."),
+    "onedrive": ("OneDrive rejects paths over 400 characters and files over "
+                 "250 GB, and its sign-in expires after 90 days of no use. "
+                 "Versioning can double the space a file uses."),
+    "dropbox": ("Dropbox rejects some filenames outright, and can only change "
+                "a file's modification time by uploading it again."),
+}
+
+CLOUD_NOTE_ALL = ("No cloud service stores symlinks, ownership or permission "
+                  "bits. Files come back as plain files owned by you.")
+
+# An rclone remote name. A name carrying ':' or '/' would silently re-point the
+# destination once it is interpolated into 'remote:path', so it is validated
+# here as well as in the engine.
+RCLONE_NAME_RE = re.compile(r"^[A-Za-z0-9_.][A-Za-z0-9_.-]*$")
+
+
+def rclone_path() -> str | None:
+    """The rclone the ENGINE would pick, in the engine's own search order.
+
+    The bundled copy wins: the desktop apps ship rclone and materialize it as
+    bin/rclone, and a self-contained app should run the version it was built
+    against rather than whatever the machine happens to have.
+    """
+    bundled = os.path.join(engine_root(), "bin", "rclone")
+    if os.path.isfile(bundled) and os.access(bundled, os.X_OK):
+        return bundled
+    for candidate in ("/opt/homebrew/bin/rclone", "/usr/local/bin/rclone"):
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return shutil.which("rclone")
+
+
+def rclone_version() -> str:
+    """'1.75.0', or '' when rclone is absent or unreadable."""
+    binary = rclone_path()
+    if not binary:
+        return ""
+    try:
+        out = subprocess.run([binary, "version"], capture_output=True,
+                             text=True, timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    first = out.splitlines()[0] if out else ""
+    match = re.match(r"^rclone\s+v?([0-9][0-9A-Za-z.\-]*)", first)
+    return match.group(1) if match else ""
+
+
+def _cloud_sh(*args: str) -> tuple[int, str]:
+    """Run lib/cloud.sh, which is where every rclone invocation lives.
+
+    Going through bash rather than calling rclone from Python is what keeps
+    gui/README.md's claim -- "It contains no backup logic" -- literally true,
+    and means the CLI and the app share one code path.
+    """
+    script = os.path.join(engine_root(), "lib", "cloud.sh")
+    if not os.path.isfile(script):
+        return 127, ""
+    try:
+        proc = subprocess.run(
+            ["/bin/bash", "-c",
+             f'REPO_ROOT="$1"; . "$1/lib/cloud.sh"; shift; "$@"',
+             "_", engine_root(), *args],
+            capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return 1, ""
+    return proc.returncode, proc.stdout
+
+
+def rclone_install_hint() -> str:
+    """Per-OS install instructions, owned by bash so the app, the CLI and the
+    engine cannot drift apart."""
+    rc, out = _cloud_sh("rclone_install_hint")
+    if rc == 0 and out.strip():
+        return out.rstrip("\n")
+    if sys.platform == "darwin":
+        return ("Install rclone:  brew install rclone\n"
+                "(or download it from https://rclone.org/downloads/ "
+                "and put it on your PATH)")
+    return ("Install rclone:  sudo apt install rclone     (Debian/Ubuntu)\n"
+            "                 sudo dnf install rclone     (Fedora)\n"
+            "                 sudo pacman -S rclone       (Arch)")
+
+
+def list_cloud_remotes() -> list[dict]:
+    """The rclone accounts this machine knows about, as
+    [{"name", "type", "description"}], filtered to the four supported types.
+
+    Returns [] and never raises when rclone is absent -- the caller is usually
+    painting a page, not performing an operation.
+    """
+    binary = rclone_path()
+    if not binary:
+        return []
+    remotes: list[dict] = []
+    try:
+        proc = subprocess.run([binary, "listremotes", "--json"],
+                              capture_output=True, text=True, timeout=15)
+        if proc.returncode == 0 and proc.stdout.strip():
+            for item in json.loads(proc.stdout):
+                remotes.append({
+                    "name": str(item.get("name", "")).rstrip(":"),
+                    "type": str(item.get("type", "")),
+                    "description": str(item.get("description", "")),
+                })
+    except (OSError, subprocess.SubprocessError, ValueError):
+        remotes = []
+    if not remotes:
+        # --json is recent; the rclone in Ubuntu's archive predates it, and
+        # that is exactly this audience. --long is "name: type description".
+        try:
+            proc = subprocess.run([binary, "listremotes", "--long"],
+                                  capture_output=True, text=True, timeout=15)
+        except (OSError, subprocess.SubprocessError):
+            return []
+        if proc.returncode != 0:
+            return []
+        for line in proc.stdout.splitlines():
+            if ":" not in line:
+                continue
+            name, _, rest = line.partition(":")
+            parts = rest.split()
+            remotes.append({
+                "name": name.strip(),
+                "type": parts[0] if parts else "",
+                "description": " ".join(parts[1:]),
+            })
+    return [r for r in remotes if r["type"] in CLOUD_TYPES]
+
+
+def cloud_remote_type(name: str) -> str:
+    for remote in list_cloud_remotes():
+        if remote["name"] == name:
+            return remote["type"]
+    return ""
+
+
+def rclone_missing_for_backups(backups: list[dict]) -> bool:
+    """rclone is optional: its absence is a PROBLEM only once a backup depends
+    on it. check_tools() deliberately does not list it."""
+    if rclone_path() is not None:
+        return False
+    return any(b.get("DEST_TYPE") == "cloud" for b in backups)
+
+
+def cloud_dest_path(form: dict) -> str:
+    """The path inside the remote, with an S3 bucket folded in as its first
+    segment.
+
+    rclone's own model is remote:path where the bucket is just segment one, so
+    a separate config key would be meaningless for three of the four providers
+    and would make DEST_PATH mean different things per provider. The wizard
+    still shows a separate labelled FIELD, so an S3 user is told a bucket is
+    required rather than failing opaquely.
+    """
+    parts = [str(form.get("cloud_bucket", "") or "").strip("/ "),
+             str(form.get("dest_path", "") or "").strip("/ ")]
+    return "/".join(p for p in parts if p)
+
+
+def write_aws_profile(profile: str, access_key: str, secret_key: str,
+                      region: str = "", path: str | None = None) -> str:
+    """Store S3 credentials in ~/.aws/credentials under a named profile.
+
+    This exists to keep the secret OFF THE COMMAND LINE. `rclone config create`
+    takes option values as arguments, so the obvious
+    `secret_access_key=...` form exposes a long-lived AWS key to any `ps` on
+    the machine for the life of the call. rclone's own `env_auth=true` +
+    `profile=` reads the standard AWS shared-credentials file instead, which is
+    both the idiomatic answer and one we can write with no subprocess at all.
+
+    An existing profile of the same name is never overwritten silently -- the
+    caller gets False from profile_exists() first and decides.
+    """
+    path = path or os.path.join(os.path.expanduser("~"), ".aws", "credentials")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    parser = configparser.RawConfigParser()
+    if os.path.exists(path):
+        parser.read(path)
+    if not parser.has_section(profile):
+        parser.add_section(profile)
+    parser.set(profile, "aws_access_key_id", access_key)
+    parser.set(profile, "aws_secret_access_key", secret_key)
+    if region:
+        parser.set(profile, "region", region)
+    # Write through a 0600 temp file: the destination must never exist, even
+    # briefly, with default permissions.
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".credentials-")
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            parser.write(fh)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    os.chmod(path, 0o600)
+    return path
+
+
+def aws_profile_exists(profile: str, path: str | None = None) -> bool:
+    path = path or os.path.join(os.path.expanduser("~"), ".aws", "credentials")
+    if not os.path.exists(path):
+        return False
+    parser = configparser.RawConfigParser()
+    try:
+        parser.read(path)
+    except configparser.Error:
+        return False
+    return parser.has_section(profile)
+
+
+def cloud_config_argv(name: str, rtype: str, options: dict) -> list[str]:
+    """argv for `rclone config create`. NEVER carries a secret -- see
+    write_aws_profile for why S3 credentials take the AWS-profile route."""
+    binary = rclone_path() or "rclone"
+    argv = [binary, "config", "create", name, rtype]
+    for key, value in options.items():
+        argv.append(f"{key}={value}")
+    return argv
+
+
+def cloud_config_runner(name: str, rtype: str, options: dict | None = None) -> PtyRunner:
+    """A not-yet-started PtyRunner for `rclone config create`.
+
+    Under the pty rclone opens the browser itself for the OAuth backends, and
+    can prompt for a pasted token on a machine with no browser -- the same
+    prompt-and-forward shape SshSetupDialog already uses. The caller starts it
+    in a thread.
+    """
+    return PtyRunner(cloud_config_argv(name, rtype, options or {}))
+
+
+def cloud_dest_display(form: dict) -> str:
+    """rclone's canonical remote:path -- the same string status.sh reports, and
+    paste-able straight into an `rclone ls`."""
+    return f"{form.get('cloud_remote', '')}:{cloud_dest_path(form)}"
+
+
+# --------------------------------------------------------------------------
 # Answers files
 # --------------------------------------------------------------------------
+
+# setup.sh's own menu order for the provider prompt.
+_CLOUD_PROVIDER_ANSWER = {"s3": "1", "drive": "2", "onedrive": "3", "dropbox": "4"}
+
 
 def build_answers(form: dict) -> dict:
     """Map wizard form state to setup.sh --answers keys.
@@ -235,6 +534,20 @@ def build_answers(form: dict) -> dict:
         answers["A_USER"] = form.get("user") or "@none"
         answers["A_DEST_PATH"] = form["dest_path"]
         answers["A_CREATE_DEST"] = "y" if form.get("create_dest", True) else "n"
+        if form.get("schedule"):
+            answers["A_SCHEDULE_YN"] = "y"
+            answers["A_SCHEDULE_CHOICE"] = form["schedule_choice"]
+            if form["schedule_choice"] == "5":
+                answers["A_SCHEDULE_CUSTOM"] = form["schedule_custom"]
+            answers["A_CRON_CONFIRM"] = "y"
+    elif form["dest_kind"] == "cloud":
+        answers["A_DEST_KIND"] = "3"
+        answers["A_RCLONE_REMOTE"] = form["cloud_remote"]
+        answers["A_CLOUD_PROVIDER"] = _CLOUD_PROVIDER_ANSWER.get(
+            form.get("cloud_type", ""), "5")
+        answers["A_DEST_PATH"] = cloud_dest_path(form)
+        answers["A_CREATE_DEST"] = "y" if form.get("create_dest", True) else "n"
+        # Cloud backups are cron-scheduled exactly like SSH ones.
         if form.get("schedule"):
             answers["A_SCHEDULE_YN"] = "y"
             answers["A_SCHEDULE_CHOICE"] = form["schedule_choice"]
@@ -419,7 +732,17 @@ def remove_backup(name: str, on_line=None) -> int:
 SYNC_DELETIONS_PROMPT = "Type 'I confirm' to delete these"
 
 # The engine's marker that the confirmation was accepted and re-verified.
-SYNC_DELETIONS_CONFIRMED = "confirmed; --delete-after enabled"
+# Deliberately transport-neutral: the SAME line for rsync and for rclone. The
+# mechanism (--delete-after, or rclone sync) is logged on the NEXT line, which
+# nothing here classifies.
+SYNC_DELETIONS_CONFIRMED = "deletions confirmed and re-verified"
+
+# Engines older than 0.3.0 said this instead. Not optional: remote.sh drives a
+# REMOTE machine's engine, which this app cannot update, and the handshake
+# refuses only engines with no VERSION file at all. Without this alias a
+# sync-deletions run against a 0.2.x server would stall at "re-verifying"
+# forever.
+SYNC_DELETIONS_CONFIRMED_LEGACY = "confirmed; --delete-after enabled"
 
 
 def looks_like_password_prompt(line: str) -> bool:
@@ -628,6 +951,13 @@ def self_check() -> int:
         print(f"MISSING tools: {' '.join(missing)}")
     rc, header, backups = status()
     print(f"rsync       : {header.get('RSYNC_BIN', '?')} ({header.get('RSYNC_FLAVOUR', '?')})")
+    # Cheapest place to catch a packaging mistake: the release workflow runs
+    # --self-check against both frozen binaries.
+    rclone = rclone_path()
+    if rclone:
+        print(f"rclone      : {rclone} ({rclone_version() or '?'})")
+    else:
+        print("rclone      : not installed (optional; only cloud backups need it)")
     print(f"backups     : {len(backups)} configured")
     for b in backups:
         print(f"  - {b.get('BACKUP')}: {b.get('VERDICT', 'never ran' if b.get('NEVER_RAN') == '1' else '?')}")

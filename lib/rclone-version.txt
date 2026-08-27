@@ -1,0 +1,19 @@
+# The rclone the desktop apps BUNDLE, pinned by version and checksum.
+#
+# Both release build jobs download from https://downloads.rclone.org/v<VERSION>/
+# and verify the SHA256 BEFORE unzipping. CI pulling an unverified binary into a
+# shipped artifact would be a supply-chain hole, not a convenience -- and pinning
+# it here makes an rclone upgrade a visible, reviewable commit rather than
+# "whatever was current the day the tag was pushed".
+#
+# To bump: pick a version, take its two lines from
+#   https://downloads.rclone.org/v<VERSION>/SHA256SUMS
+# and update all three values below.
+#
+# Only the GUI builds bundle it. The CLI tarball cannot (one tarball, two
+# architectures) and uses the system rclone; detect_rclone in lib/cloud.sh
+# searches bin/rclone first and falls through to the system one, so both work
+# with no configuration.
+VERSION=1.75.0
+SHA256_DARWIN_ARM64=35e8f2a666ce789b29111db0dd843ddabc0d59c6b609d07bcaae5d1a07cba6f8
+SHA256_LINUX_AMD64=aa2804e08f48250e71009c727124b6341cd0288465804a9a09d14663cabafbaa

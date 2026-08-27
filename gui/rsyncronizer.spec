@@ -10,16 +10,25 @@ repo = os.path.abspath(os.path.join(SPECPATH, os.pardir))
 
 # The engine file set comes from the single-source manifest — never a
 # hard-coded list (the stale-engine class of bug lives that way).
+# A leading '?' marks an OPTIONAL entry -- bin/rclone, which the release
+# workflow downloads and checksum-verifies into repo/bin before this runs.
 engine_files = []
 with open(os.path.join(repo, "lib", "engine-manifest.txt")) as _mf:
     for _line in _mf:
         _line = _line.strip()
         if _line and not _line.startswith("#"):
-            engine_files.append(_line)
+            engine_files.append((_line.lstrip("?"), not _line.startswith("?")))
 datas = []
-for rel in engine_files:
+for rel, required in engine_files:
+    src = os.path.join(repo, rel)
+    if not required and not os.path.exists(src):
+        continue
     dest = os.path.join("engine", os.path.dirname(rel)) if os.path.dirname(rel) else "engine"
-    datas.append((os.path.join(repo, rel), dest))
+    # datas, NOT binaries: rclone is a static Go binary that must be copied
+    # verbatim. binaries would run it through PyInstaller's dependency
+    # analysis and install_name_tool. datas drops the executable bit, which
+    # engine.materialize() restores.
+    datas.append((src, dest))
 # The window/desktop icon and the toolbar coffee icon, at runtime under assets/.
 datas.append((os.path.join(SPECPATH, "assets", "icon-256.png"), "assets"))
 datas.append((os.path.join(SPECPATH, "assets", "coffee.png"), "assets"))

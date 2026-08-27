@@ -21,10 +21,20 @@ mkdir -p "$dest" "$HOME/.local/bin"
 
 while IFS= read -r f; do
     case $f in ''|'#'*) continue ;; esac
+    # A leading '?' marks an OPTIONAL entry: ship it if present, skip it if
+    # not. bin/rclone is bundled only by the desktop builds; a CLI install
+    # uses the system rclone, which detect_rclone finds on its own.
+    _opt=''
+    case $f in '?'*) _opt=1; f=${f#?} ;; esac
+    if [ ! -f "$src/$f" ]; then
+        [ -n "$_opt" ] && continue
+        echo "error: manifest entry missing from this package: $f" >&2
+        exit 78
+    fi
     mkdir -p "$dest/$(dirname "$f")"
     cp "$src/$f" "$dest/$f"
     case $f in
-        *.sh|cli/rsyncronizer) chmod 755 "$dest/$f" ;;
+        *.sh|cli/rsyncronizer|bin/rclone) chmod 755 "$dest/$f" ;;
     esac
 done <"$src/lib/engine-manifest.txt"
 

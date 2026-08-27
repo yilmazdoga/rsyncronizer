@@ -1,0 +1,137 @@
+#!/bin/bash
+# Stand-in for rclone. Records the exact argv it was called with, answers the
+# handful of subcommands the engine issues, and moves no data.
+#
+# Mirrors tests/fake-rsync: $FAKE_RCLONE_ARGV holds the LAST call only, and
+# $FAKE_RCLONE_ARGV.all accumulates every call behind a '=== call' separator
+# so a prune's three invocations (preview check, recheck check, real sync) can
+# be inspected one by one.
+
+: "${FAKE_RCLONE_ARGV:=/tmp/fake-rclone-argv.txt}"
+: "${FAKE_RCLONE_EXIT:=0}"
+: "${FAKE_RCLONE_FILES:=42}"
+: "${FAKE_RCLONE_CHECKS:=100}"
+: "${FAKE_RCLONE_VERSION:=v1.68.2}"
+: "${FAKE_RCLONE_REMOTES:=gdrive:}"
+: "${FAKE_RCLONE_MISSING:=}"
+
+: >"$FAKE_RCLONE_ARGV"
+echo '=== call' >>"$FAKE_RCLONE_ARGV.all"
+for a in "$@"; do
+    printf '%s\n' "$a" >>"$FAKE_RCLONE_ARGV"
+    printf '%s\n' "$a" >>"$FAKE_RCLONE_ARGV.all"
+done
+
+# The environment scrub is a safety control, so the suite has to be able to
+# see what actually survived into the child. Everything RCLONE_* except the
+# stub's own knobs and the test seam.
+if [ -n "${FAKE_RCLONE_ENV:-}" ]; then
+    env | sed -n 's/^\(RCLONE_[A-Za-z0-9_]*\)=.*/\1/p' \
+        | grep -v '^RCLONE_BIN_OVERRIDE$' >"$FAKE_RCLONE_ENV"
+fi
+
+_verb=${1:-}
+
+case $_verb in
+    version)
+        # detect_rclone parses this. FAKE_RCLONE_VERSION=v1.50.0 exercises the
+        # version floor; a '-beta.NNNN.hash' suffix exercises the parser.
+        echo "rclone $FAKE_RCLONE_VERSION"
+        echo "- os/version: fake"
+        exit 0
+        ;;
+    listremotes)
+        printf '%s\n' $FAKE_RCLONE_REMOTES
+        exit "${FAKE_RCLONE_LIST_EXIT:-0}"
+        ;;
+    about)
+        # S3 has no `about` at all; FAKE_RCLONE_NO_ABOUT reproduces that.
+        [ -n "${FAKE_RCLONE_NO_ABOUT:-}" ] && exit 1
+        echo "Total:   1 TiB"
+        echo "Used:    100 GiB"
+        echo "Free:    924 GiB"
+        exit 0
+        ;;
+    config|mkdir|rcat|lsd|touch)
+        [ "$_verb" = rcat ] && cat >/dev/null
+        exit "${FAKE_RCLONE_LSD_EXIT:-0}"
+        ;;
+esac
+
+# --- lsf: the two listings the deletion preview differences ----------------
+#
+# The engine lists the SOURCE and the DESTINATION separately and diffs them
+# with comm(1), so the stub answers per side. FAKE_RCLONE_MISSING=N means the
+# destination holds N entries the source does not; the first has a space in it
+# so list parsing is exercised on it.
+#
+# FAKE_RCLONE_MISSING_FILE holds one count per line and each DESTINATION
+# listing consumes the first -- that is how a test makes the preview and the
+# recheck disagree. Only the destination side consumes, so one scan costs one
+# line however many listings it takes.
+if [ "$_verb" = lsf ]; then
+    _last=''
+    for a in "$@"; do _last=$a; done
+    case $_last in
+        *:*)
+            # The destination.
+            if [ -n "${FAKE_RCLONE_LSF_DST_EXIT:-}" ]; then
+                echo "2026/01/01 ERROR : error listing directory" >&2
+                exit "$FAKE_RCLONE_LSF_DST_EXIT"
+            fi
+            _miss=$FAKE_RCLONE_MISSING
+            if [ -n "${FAKE_RCLONE_MISSING_FILE:-}" ] && [ -s "$FAKE_RCLONE_MISSING_FILE" ]; then
+                _miss=$(head -1 "$FAKE_RCLONE_MISSING_FILE")
+                tail -n +2 "$FAKE_RCLONE_MISSING_FILE" >"$FAKE_RCLONE_MISSING_FILE.tmp"
+                mv "$FAKE_RCLONE_MISSING_FILE.tmp" "$FAKE_RCLONE_MISSING_FILE"
+            fi
+            printf '%s\n' 'a.txt' 'sub/b.txt'
+            if [ -n "$_miss" ] && [ "$_miss" -gt 0 ] 2>/dev/null; then
+                echo 'stale dir/gone.txt'
+                i=1
+                while [ "$i" -lt "$_miss" ]; do
+                    echo "extra_$i.txt"
+                    i=$((i + 1))
+                done
+            fi
+            exit 0
+            ;;
+        *)
+            # The source. FAKE_RCLONE_EMPTY_SRC reproduces the catastrophe the
+            # scan exists to refuse: a source that lists as empty would mark
+            # the whole destination for deletion.
+            if [ -n "${FAKE_RCLONE_LSF_SRC_EXIT:-}" ]; then
+                echo "2026/01/01 ERROR : error reading source directory" >&2
+                exit "$FAKE_RCLONE_LSF_SRC_EXIT"
+            fi
+            [ -n "${FAKE_RCLONE_EMPTY_SRC:-}" ] || printf '%s\n' 'a.txt' 'sub/b.txt'
+            exit 0
+            ;;
+    esac
+fi
+
+# --- copy / sync -----------------------------------------------------------
+_del=0
+if [ "$_verb" = sync ]; then
+    _has_delete=0
+    for a in "$@"; do
+        [ "$a" = --delete-after ] && _has_delete=1
+    done
+    # Mirrors fake-rsync: deletions are reported only when the deleting flag
+    # was really passed, so a test cannot get a deletion count by accident.
+    [ "$_has_delete" = 1 ] && _del=${FAKE_RCLONE_DELETED:-3}
+fi
+
+echo "fake-rclone: pretending to transfer" >&2
+# rclone logs its stats to stderr, and carries TWO 'Transferred:' lines --
+# bytes first, then the file count, in this order. Emitted verbatim so a
+# parser that regresses to a naive `tail -1` fails the suite.
+{
+    echo "Transferred:   	   12.345 MiB / 12.345 MiB, 100%, 1.234 MiB/s, ETA 0s"
+    echo "Checks:          $FAKE_RCLONE_CHECKS / $FAKE_RCLONE_CHECKS, 100%"
+    [ "$_del" -gt 0 ] && echo "Deleted:         $_del (files), 0 (dirs)"
+    echo "Transferred:     $FAKE_RCLONE_FILES / $FAKE_RCLONE_FILES, 100%"
+    echo "Elapsed time:    1.2s"
+} >&2
+
+exit "$FAKE_RCLONE_EXIT"

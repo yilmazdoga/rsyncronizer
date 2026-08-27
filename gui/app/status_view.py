@@ -184,7 +184,11 @@ class RunDialog(QDialog):
             self._send.setEnabled(True)
             self._entry.setFocus()
             return
-        if engine.SYNC_DELETIONS_CONFIRMED in text:
+        # The legacy alias is not optional: remote.sh drives a REMOTE
+        # machine's engine, which this app cannot update, so a 0.3.0 app can
+        # be talking to a 0.2.x server.
+        if (engine.SYNC_DELETIONS_CONFIRMED in text
+                or engine.SYNC_DELETIONS_CONFIRMED_LEGACY in text):
             self._phase.setText(self.PH_RUN)
             return
         if "nothing to prune" in text:
@@ -305,6 +309,10 @@ class BackupCard(QFrame):
                      "unmarked": "mounted but unmarked (wrong drive?)",
                      "absent": "not connected"}.get(data["DRIVE"], data["DRIVE"])
             row(r, "drive", drive, GOOD if data["DRIVE"] == "connected" else WARN); r += 1
+        elif data.get("DEST_TYPE") == "cloud":
+            label = engine.CLOUD_TYPES.get(data.get("CLOUD_PROVIDER", ""),
+                                           data.get("CLOUD_PROVIDER", "") or "?")
+            row(r, "cloud", f"{data.get('RCLONE_REMOTE', '?')}  ({label})"); r += 1
         if data.get("NEVER_RAN") != "1":
             row(r, "last run", f"{data.get('LAST_WHEN', '?')}  ({data.get('VERDICT', '')})"); r += 1
             row(r, "triggered by", data.get("TRIGGERED", "unknown")); r += 1
@@ -326,6 +334,15 @@ class BackupCard(QFrame):
             warns.append(("waiting: drive not connected", WARN))
         if data.get("BOOTSTRAP_ALERT") == "1":
             warns.append(("cron-bootstrap.log is not empty — something failed before logging", BAD))
+        if data.get("DEST_TYPE") == "cloud":
+            # In a REMOTE machine's block these facts are about THAT machine,
+            # so the message must not tell the user to fix things here.
+            where = f" on {self._remote_display}" if self._remote else ""
+            if data.get("REMOTE_DEFINED") == "0":
+                warns.append((f"the rclone account “{data.get('RCLONE_REMOTE', '?')}” "
+                              f"is no longer configured{where}", BAD))
+            if self._remote is None and engine.rclone_path() is None:
+                warns.append(("rclone is not installed — this backup cannot run", BAD))
         for text, colour in warns:
             w = QLabel(f"!! {text}")
             w.setStyleSheet(f"color: {colour}; font-weight: bold;")
@@ -455,6 +472,21 @@ class StatusView(QWidget):
         lay = QVBoxLayout(inner)
         self._cards = []
         self._remote_slots = {}
+
+        # rclone is OPTIONAL, so this banner appears only once a backup on
+        # this machine actually depends on it. engine.check_tools() (the
+        # permanent red bar in the main window) deliberately never lists it.
+        if engine.rclone_missing_for_backups(backups):
+            n = sum(1 for b in backups if b.get("DEST_TYPE") == "cloud")
+            banner = QLabel(
+                f"!! rclone is not installed, but {n} backup{'s' if n != 1 else ''} "
+                f"send{'' if n != 1 else 's'} data to a cloud service — "
+                f"{'those runs' if n != 1 else 'that run'} will fail.\n"
+                + engine.rclone_install_hint()
+            )
+            banner.setWordWrap(True)
+            banner.setStyleSheet(f"color: {WARN}; font-weight: bold;")
+            lay.addWidget(banner)
 
         local_box = QGroupBox("LOCAL")
         local_lay = QVBoxLayout(local_box)

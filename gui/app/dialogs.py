@@ -1,4 +1,5 @@
-"""Secondary dialogs: SSH key setup, add-remote, ignore-rules editor.
+"""Secondary dialogs: SSH key setup, cloud account setup, add-remote,
+ignore-rules editor.
 
 All of them drive engine scripts; none contain logic of their own. The SSH
 dialog forwards what the user types over the pty — a password prompt switches
@@ -10,14 +11,17 @@ from __future__ import annotations
 import os
 
 from PySide6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QDialog,
+    QFormLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QStackedWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -132,6 +136,237 @@ class SshSetupDialog(QDialog):
         self.send_btn.setEnabled(False)
         self.start_btn.setEnabled(True)
         self.target.setEnabled(True)
+
+    def reject(self):
+        if self._runner is not None and self._thread is not None:
+            self._runner.send("\n")
+            self._thread.wait(2000)
+            if self._thread is not None and self._thread.isRunning():
+                self._runner.terminate()
+                self._thread.wait(2000)
+        super().reject()
+
+
+class CloudConnectDialog(QDialog):
+    """Connect a cloud account, by driving rclone's own `config create`.
+
+    Two shapes, because the providers genuinely differ:
+
+      * Google Drive / OneDrive / Dropbox need an OAuth sign-in. rclone opens
+        the browser ITSELF under the pty (do not open a second one here, that
+        gives two tabs), and on a machine with no browser it prints a URL and
+        waits for a pasted token -- which is exactly the prompt-and-forward
+        shape SshSetupDialog already implements. No secret passes through this
+        process at all.
+
+      * S3 needs an access key and a secret. The secret is written to
+        ~/.aws/credentials under a named profile and the remote is created with
+        env_auth=true + profile=, so the key never reaches an argv where `ps`
+        could read it. See engine.write_aws_profile.
+
+    The secret field is masked and, like the ssh password path, is never
+    echoed into the visible stream.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Connect a cloud account")
+        self.setMinimumWidth(560)
+        self._runner: engine.PtyRunner | None = None
+        self._thread: RunnerThread | None = None
+        self.remote_name = ""
+        self.finished_rc: int | None = None
+
+        lay = QVBoxLayout(self)
+
+        top = QFormLayout()
+        self.provider = QComboBox()
+        for rtype, label in engine.CLOUD_TYPES.items():
+            self.provider.addItem(label, rtype)
+        self.provider.setCurrentIndex(1)  # Google Drive
+        self.provider.currentIndexChanged.connect(self._provider_changed)
+        self.name = QLineEdit()
+        self.name.setPlaceholderText("a short name for this account, e.g. gdrive")
+        top.addRow("Service:", self.provider)
+        top.addRow("Account name:", self.name)
+        lay.addLayout(top)
+
+        # --- S3 page ---
+        self.s3_page = QWidget()
+        s3_form = QFormLayout(self.s3_page)
+        s3_form.setContentsMargins(0, 0, 0, 0)
+        self.s3_provider = QComboBox()
+        for label, value in (("Amazon S3", "AWS"), ("Cloudflare R2", "Cloudflare"),
+                             ("Backblaze B2", "Other"), ("MinIO", "Minio"),
+                             ("Other S3-compatible", "Other")):
+            self.s3_provider.addItem(label, value)
+        self.s3_region = QLineEdit()
+        self.s3_region.setPlaceholderText("e.g. eu-west-1")
+        self.s3_endpoint = QLineEdit()
+        self.s3_endpoint.setPlaceholderText("only for non-AWS S3-compatible storage")
+        self.s3_access_key = QLineEdit()
+        self.s3_access_key.setPlaceholderText("AKIA…")
+        self.s3_secret = QLineEdit()
+        self.s3_secret.setEchoMode(QLineEdit.Password)
+        s3_form.addRow("Provider:", self.s3_provider)
+        s3_form.addRow("Region:", self.s3_region)
+        s3_form.addRow("Endpoint:", self.s3_endpoint)
+        s3_form.addRow("Access key ID:", self.s3_access_key)
+        s3_form.addRow("Secret access key:", self.s3_secret)
+
+        # --- OAuth page ---
+        self.oauth_page = QWidget()
+        oauth_lay = QVBoxLayout(self.oauth_page)
+        oauth_lay.setContentsMargins(0, 0, 0, 0)
+        oauth_note = QLabel(
+            "Your browser will open so you can sign in. Rsyncronizer never sees "
+            "your password: the sign-in happens between you, the provider and "
+            "rclone, which stores the result in its own config."
+        )
+        oauth_note.setWordWrap(True)
+        oauth_note.setStyleSheet(f"color: {MUTED};")
+        self.headless_box = QCheckBox("This machine has no browser — paste a token instead")
+        oauth_lay.addWidget(oauth_note)
+        oauth_lay.addWidget(self.headless_box)
+
+        self.stack = QStackedWidget()
+        self.stack.addWidget(self.s3_page)     # index 0
+        self.stack.addWidget(self.oauth_page)  # index 1
+        lay.addWidget(self.stack)
+
+        self.connect_btn = QPushButton("Connect")
+        self.connect_btn.setObjectName("primary")
+        self.connect_btn.clicked.connect(self._start)
+        lay.addWidget(self.connect_btn)
+
+        self.stream = QPlainTextEdit()
+        self.stream.setReadOnly(True)
+        self.stream.setStyleSheet(MONO)
+        self.stream.setMinimumHeight(200)
+        lay.addWidget(self.stream)
+
+        self.hint = QLabel("Credentials go into rclone's own config, never into Rsyncronizer.")
+        self.hint.setWordWrap(True)
+        self.hint.setStyleSheet(f"color: {MUTED};")
+        lay.addWidget(self.hint)
+
+        row = QHBoxLayout()
+        self.entry = QLineEdit()
+        self.entry.setPlaceholderText("rclone will ask here if it needs anything")
+        self.entry.setEnabled(False)
+        self.entry.returnPressed.connect(self._send)
+        self.send_btn = QPushButton("Send")
+        self.send_btn.setEnabled(False)
+        self.send_btn.clicked.connect(self._send)
+        row.addWidget(self.entry)
+        row.addWidget(self.send_btn)
+        lay.addLayout(row)
+
+        self._provider_changed()
+
+    def selected_type(self) -> str:
+        return self.provider.currentData()
+
+    def _provider_changed(self, *_):
+        self.stack.setCurrentIndex(0 if self.selected_type() == "s3" else 1)
+
+    def _start(self):
+        if self._thread is not None:
+            return
+        name = self.name.text().strip()
+        if not engine.RCLONE_NAME_RE.match(name):
+            QMessageBox.warning(
+                self, "Account name",
+                "Use letters, digits, dots, underscores and dashes only, and start "
+                "with a letter or digit. A name containing ':' or '/' would silently "
+                "re-point the destination.")
+            return
+        rtype = self.selected_type()
+        options: dict = {}
+        if rtype == "s3":
+            access = self.s3_access_key.text().strip()
+            secret = self.s3_secret.text()
+            if not access or not secret:
+                QMessageBox.warning(self, "Credentials",
+                                    "An access key ID and a secret access key are required.")
+                return
+            profile = f"rsyncronizer-{name}"
+            if engine.aws_profile_exists(profile):
+                if QMessageBox.question(
+                        self, "Overwrite profile?",
+                        f"~/.aws/credentials already has a [{profile}] profile.\n"
+                        "Replace its keys?") != QMessageBox.Yes:
+                    return
+            try:
+                path = engine.write_aws_profile(profile, access, secret,
+                                                self.s3_region.text().strip())
+            except OSError as exc:
+                QMessageBox.critical(self, "Could not save credentials", str(exc))
+                return
+            # The secret is now at rest in a 0600 file and is NOT in this argv.
+            self.s3_secret.clear()
+            options = {
+                "provider": self.s3_provider.currentData(),
+                "env_auth": "true",
+                "profile": profile,
+                "shared_credentials_file": path,
+            }
+            if self.s3_region.text().strip():
+                options["region"] = self.s3_region.text().strip()
+            if self.s3_endpoint.text().strip():
+                options["endpoint"] = self.s3_endpoint.text().strip()
+            self.stream.appendPlainText(
+                f"Saved the secret key to {path} as [{profile}] (mode 0600).\n"
+                "It is not passed on any command line.")
+        elif self.headless_box.isChecked():
+            # rclone's paste-a-token flow, for a machine with no browser.
+            options = {"config_is_local": "false"}
+
+        self.remote_name = name
+        self.connect_btn.setEnabled(False)
+        self.provider.setEnabled(False)
+        self.name.setEnabled(False)
+        self.stream.appendPlainText(f"$ rclone config create {name} {rtype} …")
+        self._runner = engine.cloud_config_runner(name, rtype, options)
+        self._thread = RunnerThread(lambda on_line: self._runner.run(on_line=on_line), self)
+        self._thread.line.connect(self._on_line)
+        self._thread.finished_rc.connect(self._on_finished)
+        self._thread.start()
+
+    def _on_line(self, text: str):
+        self.stream.appendPlainText(text)
+        stripped = text.strip()
+        if not (stripped.endswith(":") or stripped.endswith("?")):
+            return
+        self.entry.setEnabled(True)
+        self.send_btn.setEnabled(True)
+        self.entry.setFocus()
+
+    def _send(self):
+        if self._runner is None or not self.entry.isEnabled():
+            return
+        text = self.entry.text()
+        self.stream.appendPlainText(f"> {text}")
+        self._runner.send(text + "\n")
+        self.entry.clear()
+        self.entry.setEnabled(False)
+        self.send_btn.setEnabled(False)
+
+    def _on_finished(self, rc: int):
+        self.finished_rc = rc
+        self._thread = None
+        self.entry.setEnabled(False)
+        self.send_btn.setEnabled(False)
+        if rc == 0:
+            self.hint.setText(f"Connected. '{self.remote_name}' is ready to use.")
+            self.hint.setStyleSheet(f"color: {GOOD}; font-weight: bold;")
+            self.accept()
+            return
+        self.hint.setText(f"Failed (exit {rc}) — see the output above.")
+        self.hint.setStyleSheet(f"color: {BAD}; font-weight: bold;")
+        self.connect_btn.setEnabled(True)
+        self.provider.setEnabled(True)
+        self.name.setEnabled(True)
 
     def reject(self):
         if self._runner is not None and self._thread is not None:

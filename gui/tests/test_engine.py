@@ -97,7 +97,11 @@ def test_parse_porcelain():
 def test_materialize_creates_engine_and_upgrade_preserves_state(engine_home):
     root = engine.materialize()
     # Everything in the manifest lands; scripts and the CLI are executable.
-    for rel in engine.engine_files():
+    # An OPTIONAL entry ('?bin/rclone') is built at release time, not
+    # committed, so it is absent from a dev tree by design.
+    for rel, required in engine.engine_manifest():
+        if not required and not os.path.exists(os.path.join(engine.resource_root(), rel)):
+            continue
         assert os.path.isfile(os.path.join(root, rel)), rel
     assert os.access(os.path.join(root, "setup.sh"), os.X_OK)
     assert os.access(os.path.join(root, "remote.sh"), os.X_OK)

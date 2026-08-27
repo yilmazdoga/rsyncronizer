@@ -33,6 +33,24 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: fetch and verify the rclone the app bundles
+        run: |
+          # Pinned by version AND checksum in lib/rclone-version.txt, and the
+          # SHA256 is checked BEFORE unzipping: an unverified binary must never
+          # reach a shipped artifact. The spec picks bin/rclone up through the
+          # manifest's '?bin/rclone' optional entry.
+          ver=$(sed -n 's/^VERSION=//p' lib/rclone-version.txt)
+          want=$(sed -n 's/^SHA256_DARWIN_ARM64=//p' lib/rclone-version.txt)
+          asset="rclone-v${ver}-osx-arm64.zip"
+          curl -fsSL -o "$asset" "https://downloads.rclone.org/v${ver}/${asset}"
+          got=$(shasum -a 256 "$asset" | awk '{print $1}')
+          [ "$got" = "$want" ] || {
+            echo "rclone checksum mismatch: got $got want $want"; exit 1; }
+          unzip -q "$asset"
+          mkdir -p bin
+          mv "rclone-v${ver}-osx-arm64/rclone" bin/rclone
+          chmod +x bin/rclone
+          ./bin/rclone version | head -1
       - run: pip install -r gui/requirements.txt
       - name: build
         working-directory: gui
@@ -69,6 +87,24 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libegl1 libxkbcommon0
+      - name: fetch and verify the rclone the app bundles
+        run: |
+          # Pinned by version AND checksum in lib/rclone-version.txt, and the
+          # SHA256 is checked BEFORE unzipping: an unverified binary must never
+          # reach a shipped artifact. The spec picks bin/rclone up through the
+          # manifest's '?bin/rclone' optional entry.
+          ver=$(sed -n 's/^VERSION=//p' lib/rclone-version.txt)
+          want=$(sed -n 's/^SHA256_LINUX_AMD64=//p' lib/rclone-version.txt)
+          asset="rclone-v${ver}-linux-amd64.zip"
+          curl -fsSL -o "$asset" "https://downloads.rclone.org/v${ver}/${asset}"
+          got=$(sha256sum "$asset" | awk '{print $1}')
+          [ "$got" = "$want" ] || {
+            echo "rclone checksum mismatch: got $got want $want"; exit 1; }
+          unzip -q "$asset"
+          mkdir -p bin
+          mv "rclone-v${ver}-linux-amd64/rclone" bin/rclone
+          chmod +x bin/rclone
+          ./bin/rclone version | head -1
       - run: pip install -r gui/requirements.txt
       - name: build
         working-directory: gui
@@ -107,6 +143,10 @@ jobs:
           mkdir -p "$stage"
           while IFS= read -r f; do
             case $f in ''|'#'*) continue ;; esac
+            # '?' marks an OPTIONAL entry. bin/rclone is bundled only by the
+            # two desktop builds -- one tarball cannot carry two architectures
+            # -- so a CLI install uses the system rclone.
+            case $f in '?'*) f=${f#?}; [ -f "$f" ] || continue ;; esac
             mkdir -p "$stage/$(dirname "$f")"
             cp "$f" "$stage/$f"
           done < lib/engine-manifest.txt
@@ -120,6 +160,10 @@ jobs:
           "rsyncronizer-cli-${ver}/install-cli.sh"
           "$HOME/.local/bin/rsyncronizer" version
           "$HOME/.local/bin/rsyncronizer" status
+          # Graceful degradation, on the one machine that genuinely has no
+          # rclone: a query about cloud accounts must answer and exit 0, and a
+          # cloud-less install must not be reported as unhealthy.
+          "$HOME/.local/bin/rsyncronizer" cloud list
       - uses: actions/upload-artifact@v4
         with:
           name: cli

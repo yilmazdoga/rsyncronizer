@@ -90,6 +90,32 @@ cron_line_for() {
         inblk == 1 && $0 !~ /^#/ { print; exit }'
 }
 
+# Does ANY backup on this machine use the cloud transport? rclone is an
+# optional dependency -- a machine with only ssh and drive backups must not go
+# UNHEALTHY, or show an rclone line at all, merely because it updated.
+#
+# This pre-pass also caches `rclone listremotes` for the whole report. status.sh
+# runs from cron and must never make a NETWORK call: every cloud fact below is
+# answerable from the local filesystem, and an expired OAuth token must not be
+# able to hang the health report. Reachability lives in `rsyncronizer cloud
+# check`, which the user asks for explicitly.
+CLOUD_ANY=0
+RCLONE_REMOTES_CACHE=''
+if [ -d "$REPO_ROOT/config" ]; then
+    for _cd in "$REPO_ROOT"/config/*/; do
+        [ -d "$_cd" ] || continue
+        if [ "$(config_get "$_cd/destination.txt" DEST_TYPE 2>/dev/null)" = cloud ]; then
+            CLOUD_ANY=1
+            break
+        fi
+    done
+fi
+CLOUD_TOOL_OK=0
+if [ "$CLOUD_ANY" = 1 ] && command -v detect_rclone >/dev/null 2>&1 && detect_rclone; then
+    CLOUD_TOOL_OK=1
+    RCLONE_REMOTES_CACHE=$("$RCLONE_BIN" listremotes 2>/dev/null) || RCLONE_REMOTES_CACHE=''
+fi
+
 # --- header ----------------------------------------------------------------
 if [ -n "$PORCELAIN" ]; then
     p NOW "$(date '+%Y-%m-%d %H:%M:%S %z')"
@@ -103,6 +129,16 @@ if [ -n "$PORCELAIN" ]; then
     fi
     # Support-the-author state. Header keys; parse_porcelain in the GUI
     # tolerates unknown keys, and old engines simply omit these.
+    p CLOUD_CONFIGURED "$CLOUD_ANY"
+    if [ "$CLOUD_ANY" = 1 ]; then
+        if [ "$CLOUD_TOOL_OK" = 1 ]; then
+            p RCLONE_BIN "$RCLONE_BIN"
+            p RCLONE_VERSION "$RCLONE_VERSION"
+        else
+            p RCLONE_BIN ''
+            UNHEALTHY=1
+        fi
+    fi
     if _support_supported; then p SUPPORTED yes; else p SUPPORTED ''; fi
     p SUPPORT_RUNS "$(_support_num RUN_COUNT 0)"
     printf '\n'
@@ -115,6 +151,14 @@ else
     else
         printf '  rsync: NOT FOUND\n'
         UNHEALTHY=1
+    fi
+    if [ "$CLOUD_ANY" = 1 ]; then
+        if [ "$CLOUD_TOOL_OK" = 1 ]; then
+            printf '  rclone: %s (%s)\n' "$RCLONE_BIN" "$RCLONE_VERSION"
+        else
+            printf '  rclone: NOT FOUND -- cloud backups on this machine cannot run\n'
+            UNHEALTHY=1
+        fi
     fi
 fi
 
@@ -151,15 +195,34 @@ for _dir in "$REPO_ROOT"/config/*/; do
     _p=$(config_get "$_dir/destination.txt" DEST_PATH 2>/dev/null)
     _dt=$(config_get "$_dir/destination.txt" DEST_TYPE 2>/dev/null)
     _vol=$(config_get "$_dir/destination.txt" VOLUME_ROOT 2>/dev/null)
+    _rr=$(config_get "$_dir/destination.txt" RCLONE_REMOTE 2>/dev/null)
+    _cp=$(config_get "$_dir/destination.txt" CLOUD_PROVIDER 2>/dev/null)
     [ -n "$_dt" ] || _dt=ssh
     # A local destination is a plain path: building "host:path" for it produced
-    # a stray leading colon.
+    # a stray leading colon. A cloud one is rclone's own remote:path syntax,
+    # which is deliberate -- it is paste-able into an `rclone ls` command.
     if [ "$_dt" = local ]; then
         _remote=''
         _dest_disp=$_p
+    elif [ "$_dt" = cloud ]; then
+        _remote=''
+        _dest_disp="$_rr:$_p"
     else
         if [ -n "$_u" ]; then _remote="$_u@$_h"; else _remote="$_h"; fi
         _dest_disp="$_remote:$_p"
+    fi
+
+    # Is the remote this backup names still defined here? The commonest cloud
+    # failure after a reinstall or a move to a new machine, and answerable
+    # without touching the network.
+    _rdef=''
+    if [ "$_dt" = cloud ]; then
+        _rdef=0
+        if [ -n "$RCLONE_REMOTES_CACHE" ] \
+           && printf '%s\n' "$RCLONE_REMOTES_CACHE" | grep -xF -- "$_rr:" >/dev/null 2>&1; then
+            _rdef=1
+        fi
+        [ "$_rdef" = 1 ] || UNHEALTHY=1
     fi
 
     _src_missing=0
@@ -188,12 +251,25 @@ for _dir in "$REPO_ROOT"/config/*/; do
             unmarked)  printf '    drive    : mounted but unmarked (%s)\n' "$_vol" ;;
             absent)    printf '    drive    : not connected (%s)\n' "$_vol" ;;
         esac
+        if [ "$_dt" = cloud ]; then
+            printf '    cloud    : %s (%s)\n' "$_rr" "${_cp:-unspecified}"
+            if [ "$CLOUD_TOOL_OK" != 1 ]; then
+                printf '    !! rclone is not installed -- this backup cannot run\n'
+            elif [ "$_rdef" != 1 ]; then
+                printf '    !! the rclone remote %s: is not configured here -- run: rclone config\n' "$_rr"
+            fi
+        fi
     else
         p SRC "$_src"
         p SRC_MISSING "$_src_missing"
         p DEST "$_dest_disp"
         p DEST_TYPE "$_dt"
         [ -n "$_drive" ] && p DRIVE "$_drive"
+        if [ "$_dt" = cloud ]; then
+            p RCLONE_REMOTE "$_rr"
+            p CLOUD_PROVIDER "$_cp"
+            p REMOTE_DEFINED "$_rdef"
+        fi
     fi
 
     # --- schedule ---------------------------------------------------------
@@ -267,15 +343,43 @@ for _dir in "$REPO_ROOT"/config/*/; do
         *) _age=$((NOW - _epoch)) ;;
     esac
 
+    # WHICH table this code belongs to. rclone's exit codes collide with
+    # rsync's -- rclone 4 is "file not found" where rsync 4 is "unsupported
+    # action", rclone 5 is a TEMPORARY error where rsync 5 is a protocol
+    # failure -- so reading one against the other would report confident
+    # nonsense. The engine records TRANSPORT= only for rclone, so an absent
+    # key (every last-run.txt written before 0.3.0) reads as rsync.
+    _tp=$(config_get "$_log_dir/last-run.txt" TRANSPORT)
+    [ -n "$_tp" ] || _tp=rsync
+
+    # The engine's own codes come first: they mean the same thing on both
+    # transports, and neither rsync's table nor rclone's uses these numbers.
     case $_rc in
-        0)  _verdict="SUCCESS" ;;
-        24) _verdict="SUCCESS (source files vanished mid-run, benign)" ;;
-        23) _verdict="PARTIAL -- some files could not be transferred" ;;
-        12|255) _verdict="SSH FAILURE -- destination unreachable" ;;
-        30|35) _verdict="TIMEOUT -- connection stalled" ;;
         66) _verdict="REFUSED -- source empty or unreadable (check Full Disk Access)" ;;
+        69) _verdict="UNAVAILABLE -- the destination or a required tool is not usable here" ;;
         78) _verdict="MISCONFIGURED -- see the log" ;;
-        *)  _verdict="FAILED ($_rc)" ;;
+        *)
+            if [ "$_tp" = rclone ]; then
+                case $_rc in
+                    0)  _verdict="SUCCESS" ;;
+                    2)  _verdict="FAILED -- rclone usage error, check RCLONE_EXTRA_FLAGS" ;;
+                    3|4) _verdict="FAILED -- a path was not found at the remote" ;;
+                    5)  _verdict="RETRYABLE -- a temporary error at the provider; nothing was deleted" ;;
+                    6)  _verdict="PARTIAL -- some files could not be transferred" ;;
+                    7)  _verdict="AUTH FAILURE -- re-authorise (rsyncronizer cloud login)" ;;
+                    8|10) _verdict="PARTIAL -- a transfer limit was reached; re-run to continue" ;;
+                    *)  _verdict="FAILED ($_rc)" ;;
+                esac
+            else
+                case $_rc in
+                    0)  _verdict="SUCCESS" ;;
+                    24) _verdict="SUCCESS (source files vanished mid-run, benign)" ;;
+                    23) _verdict="PARTIAL -- some files could not be transferred" ;;
+                    12|255) _verdict="SSH FAILURE -- destination unreachable" ;;
+                    30|35) _verdict="TIMEOUT -- connection stalled" ;;
+                    *)  _verdict="FAILED ($_rc)" ;;
+                esac
+            fi ;;
     esac
     case $_rc in
         0|24) ;;
@@ -347,6 +451,9 @@ for _dir in "$REPO_ROOT"/config/*/; do
         p LAST_WHEN "$_when"
         p LAST_EPOCH "$_epoch"
         p RC "$_rc"
+        # Which table RC was read against, so a consumer cannot re-interpret it
+        # with the wrong one.
+        p TRANSPORT "$_tp"
         p VERDICT "$_verdict"
         p FILES "$_files"
         [ -n "$_total" ] && p TOTAL_FILES "$_total"

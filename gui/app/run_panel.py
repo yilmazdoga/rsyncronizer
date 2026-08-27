@@ -23,7 +23,7 @@ from .theme import BAD, GOOD, MUTED
 
 MONO = "font-family: Menlo, 'DejaVu Sans Mono', monospace; font-size: 12px;"
 
-# rsync/engine chatter that must not count as a transferred file.
+# rsync/rclone/engine chatter that must not count as a transferred file.
 _CHATTER_PREFIXES = (
     "sending incremental file list",
     "building file list",
@@ -37,6 +37,16 @@ _CHATTER_PREFIXES = (
     "Unmatched data",
     "Transfer starting",
     "fake-rsync",
+    "fake-rclone",
+    # rclone's end-of-run stats block. Six lines, not one: --stats-one-line
+    # collapses the block to a bytes-only summary and drops the file COUNT the
+    # engine parses FILES=/TOTAL_FILES= out of.
+    "Transferred:",
+    "Checks:",
+    "Deleted:",
+    "Renamed:",
+    "Elapsed time:",
+    "Errors:",
     "RESULT:",
     "ERROR:",
     "WARNING:",

@@ -4,14 +4,19 @@
 
 # Rsyncronizer
 
-Append-only rsync backups over SSH: engine, desktop apps and CLI. Install it
-on each machine you back up **from** (see *Install* below), or clone this
-repo and run it in place. Destinations need nothing installed beyond SSH and
-rsync.
+Append-only backups to another machine over SSH, a drive you plug in, or a
+cloud service: engine, desktop apps and CLI. Install it on each machine you
+back up **from** (see *Install* below), or clone this repo and run it in
+place. An SSH destination needs nothing installed beyond SSH and rsync; a
+cloud destination needs nothing at the far end at all.
 
 ```
-laptop (macOS)  ──►  backup-server (Linux)  ──►  nas (Synology)
-  ~/Documents          ~/backups                  /volume1/backups/
+                          ┌─►  backup-server (Linux)  ──►  nas (Synology)
+                          │      ~/backups                  /volume1/backups/
+                          │
+laptop (macOS)  ──────────┼─►  external SSD           (when you plug it in)
+  ~/Documents             │
+                          └─►  S3 · Google Drive · OneDrive · Dropbox
 ```
 
 **Nothing is ever deleted at a destination by a scheduled or plain run.** Remove
@@ -26,6 +31,13 @@ Every build is on the
 a desktop app for macOS and Linux, and a headless CLI for any machine with
 bash. All forms need `rsync` and `ssh` on the machine; macOS ships both, on
 Linux run `sudo apt install rsync openssh-client`.
+
+Cloud destinations additionally need [rclone](https://rclone.org). **The
+desktop apps ship it** — nothing to install. The CLI and a source checkout use
+the system one (`brew install rclone`, `sudo apt install rclone`). It is
+entirely optional: nothing changes for SSH and drive backups if it is absent,
+and the app only mentions it once you configure, or already own, a cloud
+backup.
 
 ### Desktop app on macOS (Apple silicon)
 
@@ -175,6 +187,57 @@ to add those to `config/<name>/exclude.txt` for you.
 Note macOS actually accepts those characters on exFAT while Linux does not, so
 exclude them on both machines if the drive is shared.
 
+## Backing up to a cloud service
+
+A backup can go to **Amazon S3 (or S3-compatible storage), Google Drive,
+OneDrive or Dropbox**. `./setup.sh` asks which you want; pick option 3. Cloud
+backups run on a schedule like SSH ones, and land by the same copy-by-name
+rule: `~/Documents` becomes `gdrive:Backups/laptop/Documents/`.
+
+rsync cannot reach any of those services — none of them speaks the rsync
+protocol or SSH — so cloud backups use **rclone** as a second transport. Which
+one a backup uses is decided by its config and nothing else; the rsync path is
+untouched.
+
+**Rsyncronizer stores no cloud credentials.** Your keys and sign-in tokens live
+in rclone's own `~/.config/rclone/rclone.conf`; this repo's config records only
+the *name* of an rclone remote. Connect an account with the app's **Connect an
+account…** button, or with `rclone config` in a terminal. `rsyncronizer cloud
+list` shows what is connected, `rsyncronizer cloud check <name>` probes one
+destination, and `rsyncronizer cloud login <remote>` re-authorises an expired
+one.
+
+> **An encrypted `rclone.conf` cannot be used for scheduled backups.** Cron has
+> nobody to type the password to, so the job would fail on every fire. Setup
+> warns about it, and a run fails fast rather than hanging on a prompt nobody
+> sees.
+
+`config/<name>/destination.txt` for a cloud backup:
+
+```
+DEST_TYPE=cloud
+RCLONE_REMOTE=gdrive
+DEST_PATH=Backups/laptop
+CLOUD_PROVIDER=drive
+```
+
+`DEST_PATH` is a path *inside* the remote, with no leading slash. For S3 its
+first segment is the bucket (`my-bucket/backups/laptop`).
+
+**Worth knowing before you rely on it:**
+
+| | |
+| --- | --- |
+| **S3** (and S3-compatible) | No free-space figure exists, so the dashboard never shows one. Reading a file's timestamp costs an extra request, so the first run is slow and chatty. |
+| **Google Drive** | Uploads are capped at 750 GB per day; a larger first backup simply continues the next day. A confirmed sync-deletions run moves entries to Drive's trash, so space is reclaimed only when you empty it. Drive can hold two files with the same name — `rclone dedupe` fixes that. |
+| **OneDrive** | Paths over 400 characters and files over 250 GB are rejected. The sign-in expires after 90 days of no use. Versioning is on by default and can double the space a file occupies. |
+| **Dropbox** | Some filenames are refused outright (`thumbs.db` and friends). Dropbox can only change a file's timestamp by uploading it again, so a timestamp-only change costs a full transfer. |
+
+**None of the four stores symlinks, ownership or permission bits**, and no
+rclone flag changes that: files come back as plain files owned by you. Restores
+and, on some providers, reads cost money — check your provider's egress pricing
+before treating a cloud copy as your only copy.
+
 ## Deleting at the destination
 
 The one sanctioned exception to the never-delete rule, and it is manual by
@@ -196,12 +259,27 @@ unmounted), it aborts with exit 75 rather than delete anything you did not see.
 Details worth knowing:
 
 - Deletion uses `--delete-after`: files are removed only **after** the transfer
-  completed, so an interrupted prune deletes nothing.
+  completed, so an interrupted prune deletes nothing. A cloud backup gets the
+  same guarantee: an ordinary run is `rclone copy`, which has no code path that
+  deletes at all, and `rclone sync --delete-after` is reachable only through
+  the gate described here.
+- On a cloud destination, what "deleted" means is the provider's business.
+  Google Drive and OneDrive move the entry to *their* trash, so space is
+  reclaimed only when you empty it — which is also a 30-day safety net rsync
+  never had.
 - It acts on the **destination side only**. The source is never touched:
   rsync's deletion is receiver-side, and `--remove-source-files` stays banned.
 - **Excluded names survive a prune.** Anything matched by `rsync-ignore.txt`
   or the per-backup `exclude.txt` (`@eaDir`, `.DS_Store`, `.rsync-partial`, …)
   is protected; only `--delete-excluded`, which stays banned, would remove it.
+  The cloud path proves this rather than assumes it: the scan and the transfer
+  are passed the same generated filter file.
+- The cloud preview is **two directory listings differenced**, not an
+  `rclone check`. check reports a file missing at the source as an `ERROR`,
+  which makes "there is something to delete" and "the scan failed" the same
+  signal — no use for a control that gates deletion. A listing either completes
+  or it does not, and a source that lists as *empty* aborts outright rather
+  than marking the whole destination for deletion.
 - It cannot be scheduled: `--sync-deletions` with `--cron` or `--on-mount` is
   refused outright, there is no config key for it, and the confirmation needs a
   real terminal on stdin *and* stdout; `echo 'I confirm' | …` does not work.
@@ -239,6 +317,8 @@ rsyncronizer status
 rsyncronizer run <name>
 rsyncronizer sync-deletions <name>
 rsyncronizer ignore            # edit the global excludes in $EDITOR
+rsyncronizer cloud list        # cloud accounts rclone knows about
+rsyncronizer cloud check <name>  # probe one cloud destination now
 rsyncronizer remote list
 rsyncronizer update            # self-update from GitHub Releases (CLI installs)
 ```
@@ -259,6 +339,13 @@ same scripts: the wizard runs `setup.sh --answers`, the dashboard renders
 safeguards: the engine's own preview streams into the dialog and you must
 type `I confirm` yourself; the app only forwards what you type, and the
 engine re-verifies the list before deleting.
+
+The wizard's Destination page offers a third choice — a cloud service — with
+an account picker and a **Connect an account…** button. Google Drive, OneDrive
+and Dropbox open your browser to sign in; S3 is a plain form. Either way the
+credentials go into rclone's own config and never into this project's config
+tree or its logs, and the S3 secret is written to `~/.aws/credentials` rather
+than passed on a command line where `ps` could read it.
 
 The app is **self-contained**: on first launch it materializes its own copy of
 the engine into `~/.local/share/rsync-backup-scripts/` (both platforms; that
@@ -282,6 +369,8 @@ Installation and the one-time macOS first-launch step are covered under
 | `status.sh` | health report; exits non-zero if something needs attention |
 | `rsync-ignore.txt` | shared exclude list, applies to every backup |
 | `lib/common.sh` | the engine |
+| `lib/cloud.sh` | the rclone transport: every rclone call lives here |
+| `lib/rclone-version.txt` | the rclone the desktop apps bundle, pinned by version and checksum |
 | `backups/<name>.sh` | generated runner; **gitignored**, recreated by `setup.sh` |
 | `config/<name>/` | source, destination, options; **gitignored** |
 | `logs/<name>/` | one log per run, newest 30 kept; **gitignored** |
@@ -317,7 +406,10 @@ to let `~/.ssh/config` decide. Key-based auth only; the key must have **no
 passphrase**, or cron can never authenticate (cron gets no ssh-agent).
 
 `config/<name>/options.txt`, every key optional: `SSH_PORT`, `BWLIMIT`,
-`TIMEOUT`, `ALLOW_EMPTY_SOURCE`, `EXTRA_FLAGS`.
+`TIMEOUT`, `ALLOW_EMPTY_SOURCE`, `EXTRA_FLAGS`. Cloud backups use
+`RCLONE_TRANSFERS`, `RCLONE_CHECKERS` and `RCLONE_EXTRA_FLAGS` instead — one
+flag key per transport, and each is refused on the other, so an rsync flag list
+can never reach rclone or the reverse.
 
 **Ignore rules, nothing hidden.** `config/global-exclude.txt` IS the global
 list: it is seeded once from the shipped defaults (`.DS_Store`, `@eaDir`,
@@ -343,8 +435,26 @@ behind a second gate that verifies the run is manual, interactive, and was
 confirmed by the typed phrase, so `EXTRA_FLAGS=--delete` still dies 78 even
 inside a prune run.
 
+Cloud backups get the same treatment from a blacklist of their own, because
+rsync's flags and rclone's are different languages: deletion (`--delete*`,
+`--max-delete`), source mutation (`--delete-empty-src-dirs`), selection
+overrides (`--files-from*`, `--include*`), credential leaks (`--dump`, which
+writes OAuth tokens and AWS signatures into a log kept for 30 runs), remote
+control (`--rc*`) and command execution (`--password-command`). The *verb* is
+the real switch: an ordinary run is `rclone copy`, `sync` is produced at one
+place in the code, and the guard re-proves the confirmation from the verb
+itself.
+
+**A flag blacklist alone would be decorative for rclone**, because rclone reads
+an environment variable for every flag it has — `RCLONE_IGNORE_ERRORS=true`
+reaches the same switch as the command-line flag, and
+`RCLONE_CONFIG_<REMOTE>_TYPE` can re-point the destination outright. Every
+`RCLONE_*` variable is therefore stripped before rclone runs, and each one
+removed is named in the log.
+
 Ownership is never preserved (`--no-o --no-g`): it only works when the receiver
-runs as root, so over an ordinary SSH login it was failing silently anyway.
+runs as root, so over an ordinary SSH login it was failing silently anyway. No
+cloud service records ownership or permissions at all.
 
 A backup **run** deletes nothing unless it is a confirmed `--sync-deletions` run:
 otherwise its only `rm` removes this repo's own old log files, plus its own
@@ -370,6 +480,23 @@ source propagates rather than being versioned.
 | 75 | prune declined at the prompt, or the deletion list changed after confirmation; nothing was transferred or deleted |
 | 78 | misconfigured, or an unsafe flag was refused |
 
+An exit code is only meaningful against the transport that produced it, and the
+two tables genuinely collide — rclone's 4 is "file not found" where rsync's is
+"unsupported action", and rclone's 5 is a *temporary* error where rsync's is a
+protocol failure. The engine records which transport ran and reads the code
+against the right table; `status.sh` does the same. For cloud backups:
+
+| | |
+| --- | --- |
+| 0 | success |
+| 3, 4 | a path was not found at the remote |
+| 5 | temporary error at the provider; nothing was deleted, re-running resumes |
+| 6 | partial; some files could not be transferred |
+| 7 | sign-in expired or the account is suspended — `rsyncronizer cloud login <remote>` |
+| 8, 10 | a transfer limit was reached (Google Drive's 750 GB/day); re-run to continue |
+| 69 | rclone is missing or too old |
+| 75 | prune declined, the list changed, or a listing could not be trusted; nothing was transferred or deleted |
+
 ## Support
 
 Rsyncronizer is completely free and will be so forever. If you find it useful,
@@ -389,6 +516,11 @@ If you have already supported (thank you!), or simply do not want to, type `i ha
   filename under a second spelling, and since nothing is ever deleted, both live
   at the destination forever and then propagate onward. It also fails outright
   on glibc, which does not know the `utf-8-mac` charset.
+- **rclone is bundled in the desktop apps, not in the CLI.** One tarball
+  cannot carry two architectures, so a CLI install uses the system rclone. The
+  engine looks for its bundled copy first and falls through to the system one,
+  so both work with no configuration. The bundled version is pinned by
+  checksum in `lib/rclone-version.txt` and verified at build time.
 - **macOS `openrsync` is fully supported.** It accepts this repo's entire flag
   set. `brew install rsync` is optional; it adds `--protect-args`, which only
   matters for destination paths containing spaces.

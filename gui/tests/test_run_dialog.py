@@ -272,3 +272,178 @@ def test_pty_runner_decline(tmp_path):
             runner.send("nope\n")
 
     assert runner.run(on_line=on_line) == 75
+
+
+# --------------------------------------------------------------------------
+# The staged dialog is transport-neutral
+# --------------------------------------------------------------------------
+
+class FakeCloudSyncRunner(FakeSyncRunner):
+    """The same conversation in rclone's wording.
+
+    The mechanism line that follows the marker must NOT be classified -- that
+    is the whole reason the marker moved off it.
+    """
+
+    def run(self, on_line=None):
+        on_line("backup   : docs")
+        on_line("prune    : scanning the destination for entries absent from the source...")
+        on_line("  will delete: extra.txt")
+        on_line("  will delete: stale dir/gone.txt")
+        on_line(engine.SYNC_DELETIONS_PROMPT
+                + " 2 entries from the destination (anything else aborts): ")
+        reply = self._q.get(timeout=30).strip()
+        if reply in ("I confirm", "i confirm"):
+            on_line("prune    : " + engine.SYNC_DELETIONS_CONFIRMED)
+            on_line("prune    : rclone sync --delete-after --max-delete=2 enabled for this run")
+            on_line("RESULT: SUCCESS (0)")
+            return 0
+        on_line("RESULT: NOT CONFIRMED -- nothing was transferred or deleted.")
+        return 75
+
+
+class LegacyEngineRunner(FakeSyncRunner):
+    """A REMOTE machine still on 0.2.x, which this app cannot update."""
+
+    def run(self, on_line=None):
+        on_line(engine.SYNC_DELETIONS_PROMPT + " 1 entries: ")
+        self._q.get(timeout=30)
+        on_line("prune    : " + engine.SYNC_DELETIONS_CONFIRMED_LEGACY + " for this run")
+        on_line("RESULT: SUCCESS (0)")
+        return 0
+
+
+def test_run_dialog_cloud_confirm_flow(qapp):
+    fake = FakeCloudSyncRunner()
+    dlg = RunDialog("docs", runner_factory=lambda: fake)
+    dlg._start_sync_deletions()
+    assert pump(qapp, lambda: dlg._entry.isEnabled())
+    assert dlg._list.count() == 2
+    dlg._entry.setText("I confirm")
+    dlg._send_reply()
+    assert pump(qapp, lambda: dlg._finished_rc == 0)
+    assert fake.sent == ["I confirm\n"]
+    dlg.deleteLater()
+
+
+def test_run_dialog_cloud_decline_flow(qapp):
+    fake = FakeCloudSyncRunner()
+    dlg = RunDialog("docs", runner_factory=lambda: fake)
+    dlg._start_sync_deletions()
+    assert pump(qapp, lambda: dlg._entry.isEnabled())
+    dlg._entry.setText("no")
+    dlg._send_reply()
+    assert pump(qapp, lambda: dlg._finished_rc == 75)
+    dlg.deleteLater()
+
+
+def test_run_dialog_accepts_the_legacy_marker(qapp):
+    # Without the alias a sync-deletions run against a 0.2.x server would sit
+    # at "re-verifying" forever.
+    fake = LegacyEngineRunner()
+    dlg = RunDialog("docs", runner_factory=lambda: fake)
+    dlg._start_sync_deletions()
+    assert pump(qapp, lambda: dlg._entry.isEnabled())
+    dlg._entry.setText("I confirm")
+    dlg._send_reply()
+    assert pump(qapp, lambda: dlg._finished_rc == 0)
+    dlg.deleteLater()
+
+
+class PhraseInStreamRunner(FakeSyncRunner):
+    """The literal phrase appears in the STREAM, before the prompt."""
+
+    def run(self, on_line=None):
+        on_line("prune    : type I confirm to delete these entries")
+        on_line("  will delete: extra.txt")
+        on_line(engine.SYNC_DELETIONS_PROMPT + " 1 entries: ")
+        self._q.get(timeout=30)
+        on_line("RESULT: NOT CONFIRMED -- nothing was transferred or deleted.")
+        return 75
+
+
+def test_dialog_never_auto_sends_the_phrase(qapp):
+    """The hard rule: nothing in the stream may cause a reply.
+
+    Only a human typing into the box can confirm. Closing the dialog sends a
+    bare newline, which is an explicit DECLINE at the engine's prompt.
+    """
+    fake = PhraseInStreamRunner()
+    dlg = RunDialog("docs", runner_factory=lambda: fake)
+    dlg._start_sync_deletions()
+    assert pump(qapp, lambda: dlg._entry.isEnabled())
+    assert fake.sent == [], "the dialog must never confirm on its own"
+    dlg.reject()
+    assert fake.sent == ["\n"], "closing declines; it never confirms"
+    dlg.deleteLater()
+
+
+# --------------------------------------------------------------------------
+# Cloud cards
+# --------------------------------------------------------------------------
+
+CLOUD_BLOCK = dict(
+    BLOCK, BACKUP="docs-to-drive", DEST="gdrive:Backups/laptop",
+    DEST_TYPE="cloud", RCLONE_REMOTE="gdrive", CLOUD_PROVIDER="drive",
+    REMOTE_DEFINED="1", TRANSPORT="rclone",
+)
+
+
+def _card_text(card):
+    from PySide6.QtWidgets import QLabel
+    return "\n".join(w.text() for w in card.findChildren(QLabel))
+
+
+def test_card_cloud_shows_the_account(qapp, monkeypatch):
+    monkeypatch.setattr(engine, "rclone_path", lambda: "/usr/bin/rclone")
+    card = BackupCard(dict(CLOUD_BLOCK), _FakeView())
+    text = _card_text(card)
+    assert "gdrive" in text and "Google Drive" in text
+    assert "gdrive:Backups/laptop" in text
+    card.deleteLater()
+
+
+def test_card_cloud_warns_when_the_account_is_gone(qapp, monkeypatch):
+    monkeypatch.setattr(engine, "rclone_path", lambda: "/usr/bin/rclone")
+    card = BackupCard(dict(CLOUD_BLOCK, REMOTE_DEFINED="0"), _FakeView())
+    assert "no longer configured" in _card_text(card)
+    card.deleteLater()
+
+
+def test_card_cloud_warns_when_rclone_is_missing(qapp, monkeypatch):
+    monkeypatch.setattr(engine, "rclone_path", lambda: None)
+    card = BackupCard(dict(CLOUD_BLOCK), _FakeView())
+    assert "rclone is not installed" in _card_text(card)
+    card.deleteLater()
+
+
+def test_card_remote_cloud_warning_names_the_other_machine(qapp, monkeypatch):
+    # In a REMOTE block these facts are about THAT machine; the warning must
+    # not tell the user to fix anything here.
+    monkeypatch.setattr(engine, "rclone_path", lambda: "/usr/bin/rclone")
+    card = BackupCard(dict(CLOUD_BLOCK, REMOTE_DEFINED="0"), _FakeView(),
+                      remote_label="workstation", remote_display="workstation")
+    text = _card_text(card)
+    assert "on workstation" in text
+    card.deleteLater()
+
+
+def test_humanize_schedule_cloud_is_not_drive_connect():
+    # humanize_schedule keys on DEST_TYPE == "local". Rewriting that as
+    # != "ssh" would print "on drive connect" for a cloud backup on */15.
+    assert engine.humanize_schedule(
+        {"SCHEDULE": "*/15 * * * *", "DEST_TYPE": "cloud", "TRIGGER": "0"}
+    ) == engine.humanize_schedule(
+        {"SCHEDULE": "*/15 * * * *", "DEST_TYPE": "ssh", "TRIGGER": "0"})
+    assert "drive" not in engine.humanize_schedule(
+        {"SCHEDULE": "*/15 * * * *", "DEST_TYPE": "cloud", "TRIGGER": "0"})
+
+
+def test_is_file_line_ignores_rclone_stats():
+    for chatter in ("Transferred:   \t 12.3 MiB / 12.3 MiB, 100%, 1 MiB/s, ETA 0s",
+                    "Checks:                 100 / 100, 100%",
+                    "Deleted:                  3 (files), 0 (dirs)",
+                    "Elapsed time:           1.2s",
+                    "Errors:                 0"):
+        assert not is_file_line(chatter), chatter
+    assert is_file_line("Documents/report.pdf")

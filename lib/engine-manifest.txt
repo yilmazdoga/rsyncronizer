@@ -5,6 +5,12 @@
 #   tests/run-tests.sh     (consistency check)
 # One path per line; blanks and # comments ignored. The manifest ships itself
 # so an installed engine home can in turn be an install source.
+#
+# A leading '?' marks an OPTIONAL entry: ship it if it is there, skip it if it
+# is not. It exists for bin/rclone, which the desktop builds download at build
+# time -- so it is present in an app bundle and absent from the repo and from
+# the CLI tarball. Every consumer above understands the marker, which is what
+# keeps this file the ONLY place the engine file set is written down.
 setup.sh
 status.sh
 remote.sh
@@ -12,6 +18,8 @@ ssh-setup.sh
 rsync-ignore.txt
 VERSION
 lib/common.sh
+lib/cloud.sh
+lib/rclone-version.txt
 lib/trigger-macos.sh
 lib/trigger-linux.sh
 lib/wait-for-mount.sh
@@ -19,3 +27,4 @@ lib/support-qr.txt
 lib/engine-manifest.txt
 tests/cron-smoke-test.sh
 cli/rsyncronizer
+?bin/rclone

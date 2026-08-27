@@ -26,6 +26,9 @@ export RSYNC_BIN_OVERRIDE=$TESTS_DIR/fake-rsync
 chmod +x "$TESTS_DIR/fake-rsync" 2>/dev/null
 
 HNAME=selftest-headless
+# Declared up here because cleanup() (installed below) references it, and the
+# cloud sections that assign it run much later.
+CNAME=selftest-cloud
 # setup.sh seeds config/global-exclude.txt in THIS repo during the headless
 # tests; remove it at the end only if it did not exist before the suite ran.
 GLOBAL_EXCLUDE_PREEXISTED=0
@@ -48,6 +51,8 @@ cleanup() {
     rm -rf "$SCRATCH"
     rm -rf "$REPO_ROOT/config/$NAME" "$REPO_ROOT/logs/$NAME" "$REPO_ROOT/backups/$NAME.sh"
     rm -rf "$REPO_ROOT/config/$HNAME" "$REPO_ROOT/logs/$HNAME" "$REPO_ROOT/backups/$HNAME.sh"
+    rm -rf "$REPO_ROOT/config/$CNAME" "$REPO_ROOT/logs/$CNAME" "$REPO_ROOT/backups/$CNAME.sh"
+    rm -rf "${XDG_CACHE_HOME:-$HOME/.cache}/rsync-backup/$CNAME.lock"
     rm -f "$REPO_ROOT/remotes/testbox.txt" "$REPO_ROOT/remotes/spacebox.txt"
     [ "$GLOBAL_EXCLUDE_PREEXISTED" = 0 ] && rm -f "$REPO_ROOT/config/global-exclude.txt"
     rm -rf "${XDG_CACHE_HOME:-$HOME/.cache}/rsync-backup/$NAME.lock"
@@ -738,13 +743,511 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# The cloud transport (rclone). Every section below mirrors an rsync one, so
+# the two safety stories are provably symmetrical rather than merely similar.
+# ---------------------------------------------------------------------------
+CNAME=selftest-cloud
+CCFG=$REPO_ROOT/config/$CNAME
+CRUNNER=$REPO_ROOT/backups/$CNAME.sh
+export FAKE_RCLONE_ARGV=$SCRATCH/rclone-argv.txt
+export RCLONE_BIN_OVERRIDE=$TESTS_DIR/fake-rclone
+chmod +x "$TESTS_DIR/fake-rclone" 2>/dev/null
+CALL=$FAKE_RCLONE_ARGV
+CALLS=$FAKE_RCLONE_ARGV.all
+rcalls() { grep -c '^=== call' "$CALLS" 2>/dev/null; }
+# The verbs actually issued, in order -- the line right after each separator.
+rverbs() { awk '/^=== call/{getline; printf "%s ", $0}' "$CALLS" 2>/dev/null; }
+
+mkdir -p "$CCFG" "$REPO_ROOT/backups"
+printf '%s\n' "$SCRATCH/src" >"$CCFG/source.txt"
+cwrite_dest() { printf '%s\n' "$@" >"$CCFG/destination.txt"; }
+cwrite_dest 'DEST_TYPE=cloud' 'RCLONE_REMOTE=gdrive' 'DEST_PATH=Backups/laptop' 'CLOUD_PROVIDER=drive'
+: >"$CCFG/options.txt"
+sed -e "s/@NAME@/$CNAME/" >"$CRUNNER" <<'EOF'
+#!/bin/bash
+set -uo pipefail
+_src=${BASH_SOURCE[0]:-$0}
+while [ -h "$_src" ]; do
+    _dir=$(cd -P "$(dirname -- "$_src")" && pwd)
+    _src=$(readlink -- "$_src")
+    case $_src in /*) ;; *) _src=$_dir/$_src ;; esac
+done
+SCRIPT_DIR=$(cd -P "$(dirname -- "$_src")" && pwd)
+REPO_ROOT=$(cd -P "$SCRIPT_DIR/.." && pwd)
+unset _src _dir
+. "$REPO_ROOT/lib/common.sh"
+run_backup "@NAME@" "$@"
+EOF
+chmod +x "$CRUNNER"
+# Reset both records; `: >file` on the .all file is what makes rcalls() honest.
+creset() { : >"$CALL"; : >"$CALLS"; }
+
+# ---------------------------------------------------------------------------
+head_ "rclone guard rejects"
+for f in --delete --delete-during --delete-after --delete-excluded \
+         --delete-empty-src-dirs --max-delete=5 --max-delete-size=1G \
+         --backup-dir=/x --suffix=.bak --track-renames --ignore-errors \
+         --inplace --files-from=/x --files-from-raw=/x --include='*.txt' \
+         --include-from=/x --max-age=1d --min-size=1M \
+         --drive-use-trash=false --dump=headers --dump-bodies \
+         --rc --rc-no-auth --rc-addr=:5572 --password-command=sh \
+         --config=/x --log-file=/x --links --interactive \
+         --error-on-no-transfer -l -P -i -Pv -vl; do
+    if ( assert_no_destructive_rclone_flags copy "$f" ) >/dev/null 2>&1; then
+        bad "rclone guard rejects $f" "it was accepted"
+    else
+        ok "rclone guard rejects $f"
+    fi
+done
+# rclone takes its paths positionally, so a bare word is a smuggled third path.
+for f in sync purge delete /etc/passwd 'gdrive:evil'; do
+    if ( assert_no_destructive_rclone_flags copy "$f" ) >/dev/null 2>&1; then
+        bad "rclone guard rejects the bare word '$f'" "it was accepted"
+    else
+        ok "rclone guard rejects the bare word '$f'"
+    fi
+done
+
+# ---------------------------------------------------------------------------
+head_ "rclone guard allows the flags we actually use"
+# The whole assembled set at once. A false positive here is not theoretical:
+# our own --error=FILE is a PREFIX of the blacklisted --error-on-no-transfer,
+# and an rsync-style abbreviation arm refused every prune because of it.
+if ( assert_no_destructive_rclone_flags copy \
+        --create-empty-src-dirs --transfers=4 --checkers=8 \
+        --timeout=600s --contimeout=60s --retries=3 --low-level-retries=10 \
+        --stats=5m --stats-log-level=NOTICE -v --color=NEVER \
+        --ask-password=false --filter-from=/tmp/delete-me.txt \
+        --bwlimit=1000K --dry-run --drive-stop-on-upload-limit \
+        --dropbox-batch-mode=sync ) >/dev/null 2>&1; then
+    ok "the real assembled flag set passes the guard"
+else
+    bad "the real assembled flag set passes the guard" \
+        "$( ( assert_no_destructive_rclone_flags copy --error=/tmp/x ) 2>&1 | head -1)"
+fi
+if ( assert_no_destructive_rclone_flags lsf --recursive --files-only --format=p ) >/dev/null 2>&1; then
+    bad "the listing verb without a sanction is refused" "it was accepted"
+else
+    ok "the listing verb without a sanction is refused"
+fi
+if ( PRUNE=1; assert_no_destructive_rclone_flags lsf --recursive --files-only --format=p ) >/dev/null 2>&1; then
+    ok "the preview's own flags pass once the prune is sanctioned"
+else
+    bad "the preview's own flags pass once the prune is sanctioned"
+fi
+
+# ---------------------------------------------------------------------------
+head_ "rclone guard controls the VERB, which is the deletion switch"
+( assert_no_destructive_rclone_flags sync ) >/dev/null 2>&1 \
+    && bad "sync is refused without a typed confirmation" "it was accepted" \
+    || ok "sync is refused without a typed confirmation"
+( PRUNE=1; assert_no_destructive_rclone_flags sync ) >/dev/null 2>&1 \
+    && bad "sync is refused with --sync-deletions but no confirmation" "accepted" \
+    || ok "sync is refused with --sync-deletions but no confirmation"
+( PRUNE=1; PRUNE_CONFIRMED=1; assert_no_destructive_rclone_flags sync ) >/dev/null 2>&1 \
+    && ok "sync is accepted only after a typed confirmation" \
+    || bad "sync is accepted after a typed confirmation"
+( PRUNE=1; PRUNE_CONFIRMED=1; FROM_CRON=1; assert_no_destructive_rclone_flags sync ) >/dev/null 2>&1 \
+    && bad "a confirmed sync is still refused under --cron" "accepted" \
+    || ok "a confirmed sync is still refused under --cron"
+for v in move purge delete rmdirs deletefile check; do
+    ( assert_no_destructive_rclone_flags "$v" ) >/dev/null 2>&1 \
+        && bad "the verb '$v' is refused" "it was accepted" \
+        || ok "the verb '$v' is refused"
+done
+# Exactly ONE site in the codebase may produce a deleting verb.
+[ "$(grep -c '_rclone_transfer_args sync' "$REPO_ROOT/lib/common.sh")" = 1 ] \
+    && ok "exactly one site in the engine can produce the verb 'sync'" \
+    || bad "exactly one site can produce the verb 'sync'" \
+           "$(grep -n '_rclone_transfer_args sync' "$REPO_ROOT/lib/common.sh")"
+
+# ---------------------------------------------------------------------------
+head_ "cloud config validation"
+cbad() {   # LABEL then destination.txt lines
+    _lbl=$1; shift
+    cwrite_dest "$@"
+    "$CRUNNER" --dry-run >"$SCRATCH/cbad.out" 2>&1
+    _rc=$?
+    [ "$_rc" = 78 ] && ok "78: $_lbl" || bad "78: $_lbl" "exit was $_rc"
+}
+cbad "cloud + HOST"          'DEST_TYPE=cloud' 'RCLONE_REMOTE=g' 'DEST_PATH=b' 'HOST=example'
+cbad "cloud + USER"          'DEST_TYPE=cloud' 'RCLONE_REMOTE=g' 'DEST_PATH=b' 'USER=alice'
+cbad "cloud + RSYNC_PATH"    'DEST_TYPE=cloud' 'RCLONE_REMOTE=g' 'DEST_PATH=b' 'RSYNC_PATH=/usr/bin/rsync'
+cbad "cloud + VOLUME_ROOT"   'DEST_TYPE=cloud' 'RCLONE_REMOTE=g' 'DEST_PATH=b' 'VOLUME_ROOT=/Volumes/x'
+cbad "cloud + DEST_FS"       'DEST_TYPE=cloud' 'RCLONE_REMOTE=g' 'DEST_PATH=b' 'DEST_FS=exfat'
+cbad "cloud without RCLONE_REMOTE" 'DEST_TYPE=cloud' 'DEST_PATH=b'
+cbad "remote containing ':'" 'DEST_TYPE=cloud' 'RCLONE_REMOTE=g:' 'DEST_PATH=b'
+cbad "remote containing '/'" 'DEST_TYPE=cloud' 'RCLONE_REMOTE=a/b' 'DEST_PATH=b'
+cbad "remote starting with '-'" 'DEST_TYPE=cloud' 'RCLONE_REMOTE=-oProxy' 'DEST_PATH=b'
+cbad "absolute DEST_PATH"    'DEST_TYPE=cloud' 'RCLONE_REMOTE=g' 'DEST_PATH=/b'
+cbad "DEST_PATH with ':'"    'DEST_TYPE=cloud' 'RCLONE_REMOTE=g' 'DEST_PATH=other:b'
+cbad "DEST_PATH starting with '-'" 'DEST_TYPE=cloud' 'RCLONE_REMOTE=g' 'DEST_PATH=-rf'
+cbad "unknown CLOUD_PROVIDER" 'DEST_TYPE=cloud' 'RCLONE_REMOTE=g' 'DEST_PATH=b' 'CLOUD_PROVIDER=azure'
+cbad "a typo'd key"          'DEST_TYPE=cloud' 'RCLONE_REMOTE=g' 'DEST_PATH=b' 'RCLONE_REMOT=g'
+cbad "ssh + RCLONE_REMOTE"   'HOST=example' 'DEST_PATH=/b' 'RCLONE_REMOTE=g'
+cbad "an unknown DEST_TYPE"  'DEST_TYPE=azure' 'DEST_PATH=b'
+cwrite_dest 'DEST_TYPE=cloud' 'RCLONE_REMOTE=gdrive' 'DEST_PATH=Backups/laptop' 'CLOUD_PROVIDER=drive'
+printf 'EXTRA_FLAGS=--no-p\n' >"$CCFG/options.txt"
+"$CRUNNER" --dry-run >/dev/null 2>&1
+[ $? = 78 ] && ok "78: rsync's EXTRA_FLAGS is refused on a cloud backup" \
+             || bad "rsync's EXTRA_FLAGS is refused on a cloud backup"
+: >"$CCFG/options.txt"
+printf 'RCLONE_TRANSFERS=4\n' >"$CFG/options.txt"
+"$RUNNER" --dry-run >/dev/null 2>&1
+[ $? = 78 ] && ok "78: RCLONE_TRANSFERS is refused on an rsync backup" \
+             || bad "RCLONE_TRANSFERS is refused on an rsync backup"
+: >"$CFG/options.txt"
+
+# ---------------------------------------------------------------------------
+head_ "cloud argv assembly"
+creset
+"$CRUNNER" --dry-run >"$SCRATCH/cloud-run.out" 2>&1
+RC=$?
+[ "$RC" = 0 ] && ok "a cloud dry run exits 0" || bad "a cloud dry run exits 0" "got $RC"
+[ "$(head -1 "$CALL")" = copy ] \
+    && ok "the verb is 'copy' on a normal run" \
+    || bad "the verb is 'copy'" "got $(head -1 "$CALL")"
+# THE load-bearing assertion. `rclone copy SRC DST` copies the CONTENTS of SRC,
+# so without the basename appended here ~/Documents lands as <dest>/ rather
+# than <dest>/Documents/.
+grep -qxF -- 'gdrive:Backups/laptop/src' "$CALL" \
+    && ok "the destination carries the source basename (copy-by-name)" \
+    || bad "the destination carries the source basename" \
+           "got: $(grep 'gdrive:' "$CALL" | tr '\n' ' ')"
+grep -qxF -- "$SCRATCH/src" "$CALL" \
+    && ok "the source is passed with no trailing slash" || bad "the source has no trailing slash"
+grep -qF -- '--filter-from=' "$CALL" \
+    && ok "the translated filter file is passed" || bad "the translated filter file is passed"
+grep -qxF -- '--stats-log-level=NOTICE' "$CALL" \
+    && ok "--stats-log-level=NOTICE (stats are INFO and invisible without it)" \
+    || bad "--stats-log-level=NOTICE is passed"
+grep -qxF -- '--color=NEVER' "$CALL" \
+    && ok "--color=NEVER (a tty would tee escape codes into the log)" || bad "--color=NEVER is passed"
+grep -qxF -- '--ask-password=false' "$CALL" \
+    && ok "--ask-password=false (an encrypted config must not block cron)" \
+    || bad "--ask-password=false is passed"
+grep -qxE -- '--(delete|max-delete).*|sync|--links|-l|--config=.*|--dump.*' "$CALL" \
+    && bad "no deletion or unsafe flag reaches rclone" "found one in argv" \
+    || ok "no deletion or unsafe flag reaches rclone"
+grep -qxF -- '--progress' "$CALL" \
+    && bad "--progress is never passed (it breaks the app's line reader)" "found it" \
+    || ok "--progress is never passed"
+grep -qxF -- "--drive-stop-on-upload-limit" "$CALL" \
+    && ok "the provider default for drive is applied" || bad "the provider default for drive is applied"
+# resolve_path would have prefixed $HOME to a relative cloud path.
+grep -q "$HOME/Backups" "$CALL" \
+    && bad "DEST_PATH is not resolved against \$HOME" "found $HOME in the destination" \
+    || ok "DEST_PATH is not resolved against \$HOME"
+grep -q 'TRANSPORT=rclone' "$REPO_ROOT/logs/$CNAME/last-run.txt" 2>/dev/null \
+    && ok "last-run.txt records TRANSPORT=rclone" || bad "last-run.txt records TRANSPORT=rclone"
+grep -q '^TRANSPORT=' "$REPO_ROOT/logs/$NAME/last-run.txt" 2>/dev/null \
+    && bad "an rsync run writes NO TRANSPORT key (absent == rsync)" "it wrote one" \
+    || ok "an rsync run writes no TRANSPORT key (absent == rsync)"
+# Two 'Transferred:' lines: bytes, then files. A naive tail -1 mashes them.
+grep -q '^FILES=42$' "$REPO_ROOT/logs/$CNAME/last-run.txt" \
+    && ok "the file count comes from the right 'Transferred:' line" \
+    || bad "the file count is parsed correctly" \
+           "$(grep '^FILES=' "$REPO_ROOT/logs/$CNAME/last-run.txt")"
+grep -q '^TOTAL_FILES=142$' "$REPO_ROOT/logs/$CNAME/last-run.txt" \
+    && ok "TOTAL_FILES is checks plus transfers" \
+    || bad "TOTAL_FILES is checks plus transfers" \
+           "$(grep '^TOTAL_FILES=' "$REPO_ROOT/logs/$CNAME/last-run.txt")"
+
+# ---------------------------------------------------------------------------
+head_ "rclone filter translation"
+# rclone matches only the LAST path element, so rsync's rules cannot be
+# forwarded: '- build' would not exclude build/foo.o, and every node_modules on
+# the machine would be backed up.
+CFILT=$REPO_ROOT/logs/$CNAME/.rclone-filter.txt
+[ -f "$CFILT" ] && ok "the translated filter file is generated" || bad "the filter file is generated"
+grep -qxF -- '- node_modules/**' "$CFILT" \
+    && ok "a directory rule becomes 'dir/**' (the only reliable form)" \
+    || bad "a directory rule becomes dir/**"
+grep -qxF -- '- node_modules/' "$CFILT" \
+    && ok "the directory rule itself is kept (recursion pruning)" || bad "the directory rule is kept"
+grep -qxF -- '- node_modules' "$CFILT" \
+    && bad "a directory-only rule must NOT exclude a FILE of that name" "it emitted a bare rule" \
+    || ok "a directory-only rule does not exclude a FILE of that name"
+grep -qxF -- '- .DS_Store' "$CFILT" && grep -qxF -- '- .DS_Store/**' "$CFILT" \
+    && ok "a bare rule covers both a file and a directory of that name" \
+    || bad "a bare rule covers both a file and a directory"
+grep -qxF -- '- #recycle' "$CFILT" \
+    && ok "'#recycle' survives translation (it is not read as a comment)" \
+    || bad "'#recycle' survives translation"
+# Regenerated every run: the source files are user-editable.
+#
+# Snapshot and restore EXACTLY, including the case where the file does not
+# exist yet: appending to a missing global-exclude.txt would create a one-line
+# one, and setup.sh further down seeds that file only when it is absent -- so a
+# sloppy restore here silently breaks a test 700 lines away.
+GEFILE=$REPO_ROOT/config/global-exclude.txt
+GE_HAD=0
+[ -f "$GEFILE" ] && { GE_HAD=1; cp "$GEFILE" "$SCRATCH/ge.orig"; }
+printf '%s\n' '- selftest-marker-xyz' >>"$GEFILE"
+"$CRUNNER" --dry-run >/dev/null 2>&1
+grep -qxF -- '- selftest-marker-xyz' "$CFILT" \
+    && ok "the filter file is regenerated when the rules change" \
+    || bad "the filter file is regenerated when the rules change"
+if [ "$GE_HAD" = 1 ]; then
+    cp "$SCRATCH/ge.orig" "$GEFILE"
+else
+    rm -f "$GEFILE"
+fi
+# A per-backup layer stacks on top of the global one.
+printf '%s\n' '- perbackup-only-xyz' >"$CCFG/exclude.txt"
+"$CRUNNER" --dry-run >/dev/null 2>&1
+grep -qxF -- '- perbackup-only-xyz' "$CFILT" \
+    && ok "the per-backup exclude layer is translated too" || bad "the per-backup layer is translated"
+rm -f "$CCFG/exclude.txt"
+
+# ---------------------------------------------------------------------------
+head_ "rclone environment scrub"
+# The argv blacklist is only half the guarantee: rclone derives an env var for
+# EVERY flag, and RCLONE_CONFIG_<REMOTE>_<KEY> can redefine the destination.
+creset
+env FAKE_RCLONE_ENV="$SCRATCH/rclone-env.txt" \
+    RCLONE_IGNORE_ERRORS=true RCLONE_CONFIG_GDRIVE_TYPE=local \
+    RCLONE_DELETE_DURING=true RCLONE_PASSWORD_COMMAND=sh \
+    "$CRUNNER" --dry-run >/dev/null 2>&1
+if [ -s "$SCRATCH/rclone-env.txt" ]; then
+    bad "no RCLONE_* variable survives into the child" \
+        "$(tr '\n' ' ' <"$SCRATCH/rclone-env.txt")"
+else
+    ok "no RCLONE_* variable survives into the child"
+fi
+CLOG=$(ls -1 "$REPO_ROOT/logs/$CNAME"/[0-9]*.log 2>/dev/null | sort -r | head -1)
+grep -q 'RCLONE_IGNORE_ERRORS' "$CLOG" \
+    && ok "the log names each stripped variable" || bad "the log names each stripped variable"
+# The seam itself must survive, or the stub disarms mid-suite.
+creset
+"$CRUNNER" --dry-run >/dev/null 2>&1
+[ "$(rcalls)" -gt 0 ] \
+    && ok "the scrub exempts the test seam (RCLONE_BIN_OVERRIDE)" \
+    || bad "the scrub exempts the test seam"
+
+# ---------------------------------------------------------------------------
+head_ "detect_rclone: version floor and absence"
+creset
+env FAKE_RCLONE_VERSION=v1.50.0 "$CRUNNER" --dry-run >"$SCRATCH/old.out" 2>&1
+[ $? = 69 ] && ok "an rclone below the floor is refused (69)" || bad "an old rclone is refused (69)"
+[ "$(rverbs)" = "version " ] \
+    && ok "nothing is transferred when the version is refused" \
+    || bad "nothing is transferred when the version is refused" "verbs: $(rverbs)"
+grep -q '1.55' "$SCRATCH/old.out" && ok "the refusal names the minimum" || bad "the refusal names the minimum"
+env FAKE_RCLONE_VERSION=v1.55.0 "$CRUNNER" --dry-run >/dev/null 2>&1
+[ $? = 0 ] && ok "exactly the floor is accepted" || bad "exactly the floor is accepted"
+env FAKE_RCLONE_VERSION=v1.69.0-beta.1234.abcdef "$CRUNNER" --dry-run >/dev/null 2>&1
+[ $? = 0 ] && ok "a -beta suffix parses" || bad "a -beta suffix parses"
+# rclone is OPTIONAL: its absence must not touch the rsync backups.
+( unset RCLONE_BIN_OVERRIDE; PATH=/usr/bin:/bin "$CRUNNER" --dry-run ) >"$SCRATCH/norc.out" 2>&1
+[ $? = 69 ] && ok "a missing rclone is refused (69)" || bad "a missing rclone is refused (69)"
+# log() writes to the run log always, and to stdout only on a terminal.
+_norc_log=$(ls -1 "$REPO_ROOT/logs/$CNAME"/[0-9]*.log 2>/dev/null | sort -r | head -1)
+grep -qi 'install rclone' "$_norc_log" \
+    && ok "the refusal says how to install it" || bad "the refusal says how to install it"
+( unset RCLONE_BIN_OVERRIDE; PATH=/usr/bin:/bin "$RUNNER" --dry-run ) >/dev/null 2>&1
+[ $? = 0 ] && ok "an rsync backup is unaffected by a missing rclone" \
+           || bad "an rsync backup is unaffected by a missing rclone"
+
+# ---------------------------------------------------------------------------
+head_ "cloud prune: the sanctioned deletion path"
+# Mirrors the rsync prune section one assertion at a time.
+creset; "$CRUNNER" --sync-deletions --cron >/dev/null 2>&1
+[ $? = 78 ] && ok "--sync-deletions --cron is refused (78)" || bad "--sync-deletions --cron is refused"
+[ "$(rcalls)" = 0 ] && ok "and rclone was never invoked" || bad "and rclone was never invoked" "$(rcalls)"
+creset; "$CRUNNER" --sync-deletions --on-mount >/dev/null 2>&1
+[ $? = 78 ] && ok "--sync-deletions --on-mount is refused (78)" || bad "--on-mount is refused"
+[ "$(rcalls)" = 0 ] && ok "and rclone was never invoked" || bad "and rclone was never invoked"
+creset; env RBS_TEST_CONFIRM_STDIN=1 "$CRUNNER" --sync-deletions --cron >/dev/null 2>&1
+[ $? = 78 ] && ok "the test seam does not lift the --cron ban" || bad "the seam does not lift --cron"
+# THE widening trap: the seam is keyed on THIS transport's own override, never
+# on "either one is set".
+creset
+( unset RCLONE_BIN_OVERRIDE
+  printf 'I confirm\n' | env RBS_TEST_CONFIRM_STDIN=1 RSYNC_BIN_OVERRIDE="$TESTS_DIR/fake-rsync" \
+      "$CRUNNER" --sync-deletions ) >/dev/null 2>&1
+[ $? = 78 ] && ok "the seam keyed on the rsync stub does NOT unlock a cloud prune" \
+             || bad "the seam must key on the transport's own override"
+creset
+printf 'no\n' | env RBS_TEST_CONFIRM_STDIN=1 FAKE_RCLONE_MISSING=3 "$CRUNNER" --sync-deletions >/dev/null 2>&1
+[ $? = 75 ] && ok "declining exits 75" || bad "declining exits 75"
+# One scan is TWO listings: the source, then the destination.
+[ "$(rverbs)" = "version lsf lsf " ] \
+    && ok "a decline runs the preview and nothing else" || bad "a decline runs only the preview" "$(rverbs)"
+for reply in 'confirm' 'I CONFIRM' 'yes' ''; do
+    creset
+    printf '%s\n' "$reply" | env RBS_TEST_CONFIRM_STDIN=1 FAKE_RCLONE_MISSING=3 \
+        "$CRUNNER" --sync-deletions >/dev/null 2>&1
+    [ $? = 75 ] && ok "the reply '$reply' aborts (75)" || bad "the reply '$reply' aborts (75)"
+done
+for reply in 'I confirm' 'i confirm'; do
+    creset
+    printf '%s\n' "$reply" | env RBS_TEST_CONFIRM_STDIN=1 FAKE_RCLONE_MISSING=3 \
+        "$CRUNNER" --sync-deletions >/dev/null 2>&1
+    [ $? = 0 ] && ok "the reply '$reply' proceeds (0)" || bad "the reply '$reply' proceeds (0)"
+    [ "$(rverbs)" = "version lsf lsf lsf lsf sync " ] \
+        && ok "  preview, recheck, then sync -- in that order" \
+        || bad "  preview, recheck, then sync" "$(rverbs)"
+done
+# check and sync must see the SAME rule set, or the confirmed list is a lie.
+# Four listings plus the sync: an excluded name must be shielded from
+# deletion exactly as it is on the rsync path, which only holds if the scan
+# and the transfer see the SAME rule set.
+[ "$(grep -cF -- '--filter-from=' "$CALLS")" = 5 ] \
+    && ok "every listing and the sync share one filter file" \
+    || bad "every listing and the sync share one filter file" "$(grep -cF -- '--filter-from=' "$CALLS")"
+grep -qxF -- '--delete-after' "$CALL" && ok "the deleting run passes --delete-after" \
+                                     || bad "the deleting run passes --delete-after"
+grep -qxF -- '--max-delete=3' "$CALL" \
+    && ok "--max-delete pins the confirmed count" || bad "--max-delete pins the confirmed count"
+grep -qxF -- '--dry-run' "$CALL" && bad "a confirmed prune is not a dry run" "found --dry-run" \
+                                || ok "a confirmed prune is not a dry run"
+grep -q 'deletions confirmed and re-verified' "$(ls -1 "$REPO_ROOT/logs/$CNAME"/[0-9]*.log | sort -r | head -1)" \
+    && ok "the confirmation marker is transport-neutral" || bad "the confirmation marker is transport-neutral"
+grep -q '^DELETED=3$' "$REPO_ROOT/logs/$CNAME/last-run.txt" \
+    && ok "the deletion count is parsed from rclone's stats" \
+    || bad "the deletion count is parsed" "$(grep DELETED "$REPO_ROOT/logs/$CNAME/last-run.txt")"
+# A list that moved between the preview and the recheck must delete nothing.
+creset
+printf '3\n5\n' >"$SCRATCH/missing.txt"
+printf 'I confirm\n' | env RBS_TEST_CONFIRM_STDIN=1 \
+    FAKE_RCLONE_MISSING_FILE="$SCRATCH/missing.txt" "$CRUNNER" --sync-deletions >/dev/null 2>&1
+[ $? = 75 ] && ok "a changed deletion list aborts (75)" || bad "a changed deletion list aborts (75)"
+[ "$(rverbs)" = "version lsf lsf lsf lsf " ] \
+    && ok "and no sync was ever issued" || bad "and no sync was ever issued" "$(rverbs)"
+# A listing that did not complete cannot be trusted: exit 0 from lsf means a
+# COMPLETE listing and nothing else, which is why the preview is two listings
+# rather than an `rclone check` (whose "missing at source" IS an ERROR line,
+# making a real failure and a real deletion indistinguishable).
+creset
+printf 'I confirm\n' | env RBS_TEST_CONFIRM_STDIN=1 FAKE_RCLONE_MISSING=2 \
+    FAKE_RCLONE_LSF_SRC_EXIT=1 "$CRUNNER" --sync-deletions >/dev/null 2>&1
+[ $? = 75 ] && ok "a failed SOURCE listing aborts (75)" || bad "a failed source listing aborts (75)"
+[ "$(rverbs)" = "version lsf " ] \
+    && ok "and it stops at the first listing" || bad "and it stops at the first listing" "$(rverbs)"
+creset
+printf 'I confirm\n' | env RBS_TEST_CONFIRM_STDIN=1 FAKE_RCLONE_MISSING=2 \
+    FAKE_RCLONE_LSF_DST_EXIT=1 "$CRUNNER" --sync-deletions >/dev/null 2>&1
+[ $? = 75 ] && ok "a failed DESTINATION listing aborts (75)" || bad "a failed destination listing aborts (75)"
+case $(rverbs) in *sync*) bad "and no sync was issued" "$(rverbs)" ;; *) ok "and no sync was issued" ;; esac
+# THE catastrophic direction. A source that lists as empty would mark every
+# file at the destination for deletion.
+creset
+printf 'I confirm\n' | env RBS_TEST_CONFIRM_STDIN=1 FAKE_RCLONE_MISSING=2 \
+    FAKE_RCLONE_EMPTY_SRC=1 "$CRUNNER" --sync-deletions >"$SCRATCH/emptysrc.out" 2>&1
+[ $? = 75 ] && ok "a source that lists as EMPTY aborts (75)" || bad "an empty source listing aborts (75)"
+case $(rverbs) in *sync*) bad "and no sync was issued" "$(rverbs)" ;; *) ok "and no sync was issued" ;; esac
+grep -q 'EMPTY' "$(ls -1 "$REPO_ROOT/logs/$CNAME"/[0-9]*.log | sort -r | head -1)" \
+    && ok "and the log says why" || bad "and the log says why"
+# A destination that does not exist yet is a FIRST RUN, not a failure.
+creset
+printf 'I confirm\n' | env RBS_TEST_CONFIRM_STDIN=1 FAKE_RCLONE_LSF_DST_EXIT=3 \
+    "$CRUNNER" --sync-deletions >/dev/null 2>&1
+[ $? = 0 ] && ok "a destination that does not exist yet is a first run, not an error" \
+           || bad "a missing destination is a first run"
+# Nothing to prune degrades to an ordinary append-only run.
+creset
+printf 'I confirm\n' | env RBS_TEST_CONFIRM_STDIN=1 FAKE_RCLONE_MISSING=0 \
+    "$CRUNNER" --sync-deletions >/dev/null 2>&1
+[ $? = 0 ] && ok "an empty deletion list continues as a normal run" || bad "an empty list continues"
+[ "$(rverbs)" = "version lsf lsf copy " ] \
+    && ok "  with the verb still 'copy'" || bad "  with the verb still copy" "$(rverbs)"
+grep -q '^DELETED=' "$REPO_ROOT/logs/$CNAME/last-run.txt" \
+    && bad "no DELETED count is recorded when nothing was pruned" "one was" \
+    || ok "no DELETED count is recorded when nothing was pruned"
+# The dry-run preview never assembles a deleting verb at all.
+creset
+env RBS_TEST_CONFIRM_STDIN=1 FAKE_RCLONE_MISSING=3 "$CRUNNER" --sync-deletions --dry-run >/dev/null 2>&1
+[ $? = 0 ] && ok "--sync-deletions --dry-run exits 0" || bad "--sync-deletions --dry-run exits 0"
+[ "$(rverbs)" = "version lsf lsf copy " ] \
+    && ok "  and never assembles 'sync'" || bad "  and never assembles sync" "$(rverbs)"
+grep -q '^DELETED=' "$REPO_ROOT/logs/$CNAME/last-run.txt" \
+    && bad "a prune dry run records no DELETED count" "it recorded one" \
+    || ok "a prune dry run records no DELETED count"
+# RCLONE_EXTRA_FLAGS can never reach the deletion switch.
+for f in 'sync' '--delete-after' '--ignore-errors' '--drive-use-trash=false' '--dump=auth'; do
+    creset
+    printf 'RCLONE_EXTRA_FLAGS=%s\n' "$f" >"$CCFG/options.txt"
+    printf 'I confirm\n' | env RBS_TEST_CONFIRM_STDIN=1 FAKE_RCLONE_MISSING=3 \
+        "$CRUNNER" --sync-deletions >/dev/null 2>&1
+    _rc=$?
+    case $(rverbs) in
+        *sync*) bad "RCLONE_EXTRA_FLAGS=$f cannot reach a sync" "verbs: $(rverbs)" ;;
+        *) [ "$_rc" = 78 ] && ok "RCLONE_EXTRA_FLAGS=$f is refused (78), no sync" \
+                           || bad "RCLONE_EXTRA_FLAGS=$f is refused (78)" "exit $_rc" ;;
+    esac
+done
+: >"$CCFG/options.txt"
+# Audit files keep the rsync path's naming and stay out of the run-log ring.
+ls -1 "$REPO_ROOT/logs/$CNAME"/prune-*-preview.log >/dev/null 2>&1 \
+    && ok "the preview audit log is prune-<ts>-preview.log" || bad "the preview audit log is named right"
+ls -1 "$REPO_ROOT/logs/$CNAME"/prune-*-recheck.log >/dev/null 2>&1 \
+    && ok "the recheck audit log is prune-<ts>-recheck.log" || bad "the recheck audit log is named right"
+ls -1 "$REPO_ROOT/logs/$CNAME"/prune-*.log 2>/dev/null | grep -q '^.*/[0-9]' \
+    && bad "prune logs stay out of the [0-9]*.log ring" "one matches the run-log glob" \
+    || ok "prune logs stay out of the [0-9]*.log run-log ring"
+
+# ---------------------------------------------------------------------------
+head_ "cloud verdicts and status.sh"
+for pair in '0:SUCCESS' '2:FAILED (2)' '5:RETRYABLE' '6:PARTIAL' '7:AUTH FAILURE'; do
+    _code=${pair%%:*}; _want=${pair#*:}
+    creset
+    env FAKE_RCLONE_EXIT="$_code" "$CRUNNER" >/dev/null 2>&1
+    _log=$(ls -1 "$REPO_ROOT/logs/$CNAME"/[0-9]*.log | sort -r | head -1)
+    grep -q "RESULT: $_want" "$_log" \
+        && ok "rclone exit $_code reads as $_want" \
+        || bad "rclone exit $_code reads as $_want" "$(grep '^RESULT:' "$_log")"
+done
+# The two tables must not be able to contaminate each other. rclone 5 is a
+# TEMPORARY error; rsync 5 is a protocol failure.
+env FAKE_RSYNC_EXIT=23 "$RUNNER" >/dev/null 2>&1
+env FAKE_RCLONE_EXIT=7 "$CRUNNER" >/dev/null 2>&1
+POUT=$SCRATCH/porcelain-cloud.txt
+"$REPO_ROOT/status.sh" --porcelain >"$POUT" 2>&1
+awk -v n="$NAME" '/^BACKUP=/{b=($0=="BACKUP=" n)} b && /^VERDICT=/{print}' "$POUT" | grep -q 'PARTIAL' \
+    && ok "the rsync backup still reads against rsync's table" \
+    || bad "the rsync backup reads against rsync's table" \
+           "$(awk -v n="$NAME" '/^BACKUP=/{b=($0=="BACKUP=" n)} b && /^VERDICT=/{print}' "$POUT")"
+awk -v n="$CNAME" '/^BACKUP=/{b=($0=="BACKUP=" n)} b && /^VERDICT=/{print}' "$POUT" | grep -q 'AUTH FAILURE' \
+    && ok "the cloud backup reads against rclone's table, in the SAME report" \
+    || bad "the cloud backup reads against rclone's table" \
+           "$(awk -v n="$CNAME" '/^BACKUP=/{b=($0=="BACKUP=" n)} b && /^VERDICT=/{print}' "$POUT")"
+for k in 'DEST_TYPE=cloud' 'RCLONE_REMOTE=gdrive' 'CLOUD_PROVIDER=drive' 'REMOTE_DEFINED=1' 'TRANSPORT=rclone'; do
+    grep -qxF -- "$k" "$POUT" && ok "porcelain carries $k" || bad "porcelain carries $k"
+done
+grep -qxF -- 'CLOUD_CONFIGURED=1' "$POUT" && ok "porcelain carries CLOUD_CONFIGURED=1" \
+                                          || bad "porcelain carries CLOUD_CONFIGURED=1"
+grep -qxF -- 'DEST=gdrive:Backups/laptop' "$POUT" \
+    && ok "the destination renders as remote:path" || bad "the destination renders as remote:path"
+# status.sh must never make a network call: it runs from cron, where an expired
+# token would otherwise hang the health report.
+creset
+"$REPO_ROOT/status.sh" --porcelain >/dev/null 2>&1
+case $(rverbs) in
+    *lsd*|*about*|*lsf*|*copy*|*sync*|*check*)
+        bad "status.sh makes no network call" "it ran: $(rverbs)" ;;
+    *) ok "status.sh makes no network call (only listremotes/version, both local)" ;;
+esac
+# The scan's two sides must never be merged: rclone's own log goes to stderr
+# and the paths to stdout, so a NOTICE line cannot enter the confirmed list.
+grep -q 'NOTICE\|INFO' "$REPO_ROOT/logs/$CNAME/.prune-list-confirmed.txt" 2>/dev/null \
+    && bad "no log line can enter the confirmed deletion list" "found one" \
+    || ok "no log line can enter the confirmed deletion list"
+env FAKE_RCLONE_REMOTES='other:' "$REPO_ROOT/status.sh" --porcelain >"$SCRATCH/p2.txt" 2>&1
+grep -qxF -- 'REMOTE_DEFINED=0' "$SCRATCH/p2.txt" \
+    && ok "a vanished rclone remote is reported" || bad "a vanished rclone remote is reported"
+env FAKE_RCLONE_EXIT=0 "$CRUNNER" >/dev/null 2>&1
+
+# ---------------------------------------------------------------------------
 head_ "portability lint"
-for f in "$REPO_ROOT/lib/common.sh" "$REPO_ROOT/setup.sh" "$REPO_ROOT/status.sh"; do
+for f in "$REPO_ROOT/lib/common.sh" "$REPO_ROOT/lib/cloud.sh" "$REPO_ROOT/setup.sh" \
+         "$REPO_ROOT/status.sh" "$TESTS_DIR/fake-rclone"; do
     /bin/bash -n "$f" 2>/dev/null && ok "bash 3.2 parses $(basename "$f")" \
                                   || bad "bash 3.2 parses $(basename "$f")"
 done
 if grep -nE 'declare -A|[^a-z]mapfile|readarray|\$\{[A-Za-z_]+,,\}' \
-        "$REPO_ROOT/lib/common.sh" "$REPO_ROOT/setup.sh" "$REPO_ROOT/status.sh" \
+        "$REPO_ROOT/lib/common.sh" "$REPO_ROOT/lib/cloud.sh" "$REPO_ROOT/setup.sh" \
+        "$REPO_ROOT/status.sh" \
         | grep -v '^\s*#' | grep -vE ':\s*#' | grep -q .; then
     bad "no bash 4+ constructs" "$(grep -nE 'declare -A|mapfile|readarray' "$REPO_ROOT"/lib/common.sh)"
 else
@@ -1289,11 +1792,35 @@ head_ "cli/rsyncronizer + the engine manifest"
 
 # The manifest is the single source: every entry exists, no hard-coded copies.
 MISSING=''
+OPTIONAL=''
 while IFS= read -r _mf; do
     case $_mf in ''|'#'*) continue ;; esac
+    # '?' marks an entry that is built, not committed (bin/rclone).
+    case $_mf in
+        '?'*) OPTIONAL="$OPTIONAL ${_mf#?}"; continue ;;
+    esac
     [ -f "$REPO_ROOT/$_mf" ] || MISSING="$MISSING $_mf"
 done <"$REPO_ROOT/lib/engine-manifest.txt"
-[ -z "$MISSING" ] && ok "every manifest entry exists" || bad "every manifest entry exists" "missing:$MISSING"
+[ -z "$MISSING" ] && ok "every required manifest entry exists" \
+                  || bad "every required manifest entry exists" "missing:$MISSING"
+# The marker only earns its keep if EVERY consumer understands it; a parser
+# that missed it would either crash the CLI build or silently drop the binary.
+if [ -n "$OPTIONAL" ]; then
+    ok "the manifest marks build-time entries optional:$OPTIONAL"
+    for _c in gui/app/engine.py gui/rsyncronizer.spec cli/install-cli.sh .github/workflows/release.yml; do
+        grep -q '?' "$REPO_ROOT/$_c" && grep -qiE 'optional|startswith\("\?"\)|lstrip|\$\{f#\?\}|\$\{_mf#\?\}' "$REPO_ROOT/$_c" \
+            && ok "  $_c handles it" || bad "  $_c handles the optional marker"
+    done
+    # A leading '?' must never survive into a path.
+    for _o in $OPTIONAL; do
+        case $_o in '?'*) bad "the marker is stripped from '$_o'" ;; *) ok "  the marker is stripped from $_o" ;; esac
+    done
+fi
+grep -q 'lib/cloud.sh' "$REPO_ROOT/lib/engine-manifest.txt" \
+    && ok "lib/cloud.sh ships (a cloud backup is useless without it)" \
+    || bad "lib/cloud.sh is in the manifest"
+grep -q 'lib/rclone-version.txt' "$REPO_ROOT/lib/engine-manifest.txt" \
+    && ok "lib/rclone-version.txt ships" || bad "lib/rclone-version.txt is in the manifest"
 grep -q 'ENGINE_FILES = \[' "$REPO_ROOT/gui/app/engine.py" \
     && bad "engine.py reads the manifest (no hard-coded list)" "found a literal list" \
     || ok "engine.py reads the manifest (no hard-coded list)"
@@ -1365,6 +1892,7 @@ UPD=$SCRATCH/upd-release
 mkdir -p "$UPD/rsyncronizer-cli-9.9.9"
 while IFS= read -r _mf; do
     case $_mf in ''|'#'*) continue ;; esac
+    case $_mf in '?'*) _mf=${_mf#?}; [ -f "$REPO_ROOT/$_mf" ] || continue ;; esac
     mkdir -p "$UPD/rsyncronizer-cli-9.9.9/$(dirname "$_mf")"
     cp "$REPO_ROOT/$_mf" "$UPD/rsyncronizer-cli-9.9.9/$_mf"
 done <"$REPO_ROOT/lib/engine-manifest.txt"

@@ -37,6 +37,11 @@ backups/*
 
 CLAUDE.md
 
+# The rclone the desktop builds bundle. Downloaded and checksum-verified by
+# the release workflow into bin/, never committed -- lib/rclone-version.txt is
+# what is under review, not the binary.
+/bin/
+
 # GUI build artifacts (anchored on purpose -- see the template warning above).
 /gui/build/
 /gui/dist/

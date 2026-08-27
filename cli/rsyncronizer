@@ -63,6 +63,9 @@ ${B}usage:${N} rsyncronizer <command> [args]
   ${C}remote${N} rm <label>
   ${C}remote${N} <label> status
   ${C}remote${N} <label> run|dry|sync-deletions <name>
+  ${C}cloud${N} list                   cloud accounts rclone knows about
+  ${C}cloud${N} check <name>           probe one cloud destination now
+  ${C}cloud${N} login <remote>         re-authorise an expired cloud account
   ${G}ssh-setup${N} [user@]host        set up key-based auth (password asked once)
   ${G}update${N}                       update this install from GitHub Releases
   ${G}support${N} [--done]             buy the author a coffee / say you already did
@@ -192,6 +195,92 @@ case $cmd in
             exit 0
         fi
         exec "$ROOT/remote.sh" "$@"
+        ;;
+    cloud)
+        # Validate BEFORE sourcing: common.sh replaces this script's die()
+        # with its own code-first variant.
+        _sub=${1:-list}
+        case $_sub in
+            list|check|login) ;;
+            *) die "usage: rsyncronizer cloud list|check <name>|login <remote>" ;;
+        esac
+        REPO_ROOT=$ROOT
+        . "$ROOT/lib/common.sh"
+        if ! command -v detect_rclone >/dev/null 2>&1 || ! detect_rclone; then
+            # `cloud list` is a QUESTION, not an operation, so a machine
+            # without rclone answers it and exits 0. rclone is optional here.
+            printf '%srclone is not installed.%s Cloud destinations need it; SSH and
+' "$B" "$N"
+            printf 'drive backups do not.
+
+'
+            command -v rclone_install_hint >/dev/null 2>&1 && rclone_install_hint
+            [ "$_sub" = list ] && exit 0
+            exit 69
+        fi
+        case $_sub in
+            list)
+                printf '%sCloud accounts rclone knows about%s
+' "$B" "$N"
+                _remotes=$("$RCLONE_BIN" listremotes --long 2>/dev/null)                     || _remotes=$("$RCLONE_BIN" listremotes 2>/dev/null) || _remotes=''
+                if [ -n "$_remotes" ]; then
+                    printf '%s\n' "$_remotes" | sed 's/^/  /'
+                else
+                    printf '  (none yet -- add one with: rclone config)\n'
+                fi
+                printf '\n%sBackups using one%s\n' "$B" "$N"
+                _any=0
+                for _d in "$ROOT"/config/*/; do
+                    [ -d "$_d" ] || continue
+                    [ "$(config_get "$_d/destination.txt" DEST_TYPE 2>/dev/null)" = cloud ] || continue
+                    _any=1
+                    printf '  %-28s -> %s:%s\n' "$(basename "$_d")" \
+                        "$(config_get "$_d/destination.txt" RCLONE_REMOTE)" \
+                        "$(config_get "$_d/destination.txt" DEST_PATH)"
+                done
+                [ "$_any" = 0 ] && printf '  (none)\n'
+                exit 0
+                ;;
+            check)
+                # The DELIBERATE network call. status.sh never makes one -- it
+                # runs from cron, where an expired token must not hang the
+                # health report -- so reachability lives here, where the user
+                # asked for it.
+                # die() is code-first from here down: sourcing common.sh
+                # above replaced this script's own message-first version.
+                valid_name "${2:-}" || die 78 "usage: rsyncronizer cloud check <name>"
+                _cd=$ROOT/config/$2
+                [ -d "$_cd" ] || die 78 "no backup named '$2' is configured here"
+                [ "$(config_get "$_cd/destination.txt" DEST_TYPE)" = cloud ] \
+                    || die 78 "'$2' is not a cloud backup"
+                _r=$(config_get "$_cd/destination.txt" RCLONE_REMOTE)
+                _pth=$(config_get "$_cd/destination.txt" DEST_PATH)
+                printf 'probing %s:%s ...\n' "$_r" "$_pth"
+                if "$RCLONE_BIN" lsf "$_r:$_pth" --max-depth 1 --ask-password=false \
+                       >/dev/null 2>&1 </dev/null; then
+                    printf '  %sok%s   %s:%s answers\n' "$G" "$N" "$_r" "$_pth"
+                else
+                    printf '  %sFAILED%s  could not list %s:%s\n' "$R" "$N" "$_r" "$_pth"
+                    printf '         re-authorise with: rsyncronizer cloud login %s\n' "$_r"
+                    exit 1
+                fi
+                if _ab=$("$RCLONE_BIN" about "$_r:" 2>/dev/null </dev/null); then
+                    printf '  %sok%s   %s\n' "$G" "$N" "$(printf '%s' "$_ab" | tr '\n' ' ')"
+                else
+                    printf '       (this service reports no free-space figure)\n'
+                fi
+                exit 0
+                ;;
+            login)
+                # Turns a cryptic exit 7 into one command. The likeliest cloud
+                # failure by far: OneDrive sign-ins expire after 90 days.
+                case ${2:-} in
+                    ''|[!A-Za-z0-9]*|*[!A-Za-z0-9._-]*)
+                        die 78 "usage: rsyncronizer cloud login <remote>   (letters, digits, . _ - only)" ;;
+                esac
+                exec "$RCLONE_BIN" config reconnect "$2:"
+                ;;
+        esac
         ;;
     update)
         # Self-update for CLI-only installs. On a machine that runs the GUI
