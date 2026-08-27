@@ -32,10 +32,24 @@ while IFS= read -r f; do
         exit 78
     fi
     mkdir -p "$dest/$(dirname "$f")"
-    cp "$src/$f" "$dest/$f"
+    # Write to a temp file and RENAME it into place, never cp over the target.
+    #
+    # cp truncates and rewrites the SAME inode, and bash reads a script
+    # incrementally from a byte offset -- so overwriting a script that is
+    # currently running makes execution resume inside the NEW bytes. That is
+    # not theoretical: `rsyncronizer update` runs this installer from inside
+    # the very script it replaces, and 0.2.0 -> 0.3.0 (284 -> 373 lines) landed
+    # mid-`case` and died with "syntax error near unexpected token `('".
+    #
+    # rename(2) gives the new content a NEW inode, so anything already reading
+    # the old one keeps a complete, consistent copy to the end. Same protection
+    # for lib/common.sh under a backup that is running during an update.
+    # chmod BEFORE the rename, so the file is never briefly non-executable.
+    cp "$src/$f" "$dest/$f.rbs-new"
     case $f in
-        *.sh|cli/rsyncronizer|bin/rclone) chmod 755 "$dest/$f" ;;
+        *.sh|cli/rsyncronizer|bin/rclone) chmod 755 "$dest/$f.rbs-new" ;;
     esac
+    mv -f "$dest/$f.rbs-new" "$dest/$f"
 done <"$src/lib/engine-manifest.txt"
 
 ln -sf "$dest/cli/rsyncronizer" "$HOME/.local/bin/rsyncronizer"

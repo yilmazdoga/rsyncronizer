@@ -1898,6 +1898,28 @@ while IFS= read -r _mf; do
 done <"$REPO_ROOT/lib/engine-manifest.txt"
 cp "$REPO_ROOT/cli/install-cli.sh" "$UPD/rsyncronizer-cli-9.9.9/install-cli.sh"
 printf '9.9.9\n' >"$UPD/rsyncronizer-cli-9.9.9/VERSION"
+# The new CLI must be a DIFFERENT SIZE from the one doing the updating.
+#
+# `rsyncronizer update` runs the new installer from INSIDE the script the
+# installer replaces, and bash reads a script incrementally from a byte
+# offset -- so if the file is rewritten in place, execution resumes inside the
+# NEW bytes. When both copies are byte-identical the offset lands in identical
+# content and nothing shows; that is why this suite passed while 0.2.0 -> 0.3.0
+# (284 -> 373 lines) died in the field with
+#     syntax error near unexpected token `('
+# Padding makes the two copies differ in size, which is the realistic shape.
+#
+# The end-to-end symptom is NOT reliably reproducible, though: whether the
+# resumed offset lands on a parseable boundary depends on how much bash had
+# already buffered. The deterministic regression test is the INODE assertion
+# below -- install must RENAME, never write over the target -- which was
+# verified to fail against the old cp-based installer and pass with the fix.
+{
+    head -1 "$REPO_ROOT/cli/rsyncronizer"
+    i=0
+    while [ "$i" -lt 400 ]; do printf '# pad %s\n' "$i"; i=$((i + 1)); done
+    tail -n +2 "$REPO_ROOT/cli/rsyncronizer"
+} >"$UPD/rsyncronizer-cli-9.9.9/cli/rsyncronizer"
 # The tarball must be NAMED like the real release asset: the URL matcher
 # keys on 'rsyncronizer-cli-' appearing in the download URL.
 tar -czf "$UPD/rsyncronizer-cli-9.9.9.tar.gz" -C "$UPD" rsyncronizer-cli-9.9.9
@@ -1914,6 +1936,28 @@ RC=$?
 [ "$(cat "$SCRATCH/clihome/.local/share/rsync-backup-scripts/VERSION")" = "9.9.9" ] \
     && ok "the installed engine is now the new version" \
     || bad "the installed engine is now the new version"
+# End-to-end sanity: necessary, not sufficient (see the note above; the
+# inode assertion below is what actually pins the fix).
+grep -q 'syntax error' "$SCRATCH/cli-update.out" \
+    && bad "replacing a RUNNING script does not corrupt it" \
+           "$(grep -m1 'syntax error' "$SCRATCH/cli-update.out")" \
+    || ok "replacing a RUNNING script does not corrupt it"
+grep -q 'updated to 9.9.9' "$SCRATCH/cli-update.out" \
+    && ok "  and it reaches its own final line" \
+    || bad "  and it reaches its own final line" "$(tail -2 "$SCRATCH/cli-update.out")"
+# The mechanism, asserted directly: install must RENAME, never cp over the
+# target, so a reader of the old inode keeps a complete file.
+CLI_INSTALLED=$SCRATCH/clihome/.local/share/rsync-backup-scripts/cli/rsyncronizer
+INO_BEFORE=$(ls -i "$CLI_INSTALLED" | awk '{print $1}')
+env HOME="$SCRATCH/clihome" XDG_DATA_HOME="$SCRATCH/clihome/.local/share" \
+    "$UPD/rsyncronizer-cli-9.9.9/install-cli.sh" >/dev/null 2>&1
+INO_AFTER=$(ls -i "$CLI_INSTALLED" | awk '{print $1}')
+[ "$INO_BEFORE" != "$INO_AFTER" ] \
+    && ok "  install replaces by rename (new inode), never in place" \
+    || bad "  install replaces by rename" "inode unchanged: $INO_BEFORE"
+ls "$SCRATCH/clihome/.local/share/rsync-backup-scripts/cli/" | grep -q 'rbs-new' \
+    && bad "  no .rbs-new temp file is left behind" "found one" \
+    || ok "  no .rbs-new temp file is left behind"
 env HOME="$SCRATCH/clihome" XDG_DATA_HOME="$SCRATCH/clihome/.local/share" \
     RBS_UPDATE_API_URL="file://$UPD/api.json" \
     "$SCRATCH/clihome/.local/bin/rsyncronizer" update >"$SCRATCH/cli-update2.out" 2>&1

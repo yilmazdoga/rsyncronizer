@@ -122,13 +122,26 @@ def materialize(force: bool = False) -> str:
         if not required and not os.path.exists(s):
             continue
         os.makedirs(os.path.dirname(d), exist_ok=True)
-        shutil.copyfile(s, d)
+        # Write beside the target and RENAME, never copy over it.
+        #
+        # copyfile truncates and rewrites the SAME inode, and bash reads a
+        # script incrementally from a byte offset -- so replacing a script that
+        # is currently running makes execution resume inside the NEW bytes.
+        # This runs on EVERY launch, so a backup running at that moment would
+        # have lib/common.sh swapped underneath it. (The CLI installer hit the
+        # same thing for real on 0.2.0 -> 0.3.0: "syntax error near unexpected
+        # token `('".) os.replace is an atomic rename: the new content gets a
+        # new inode and any reader of the old one still sees it whole.
+        tmp = d + ".rbs-new"
+        shutil.copyfile(s, tmp)
         # bin/rclone rides in PyInstaller's datas, not binaries -- a static Go
         # binary must be copied verbatim rather than run through dependency
-        # analysis -- and datas drops the executable bit.
+        # analysis -- and datas drops the executable bit. chmod BEFORE the
+        # rename, so the file is never briefly non-executable.
         if (d.endswith(".sh")
                 or os.path.basename(d) in ("rsyncronizer", "rclone")):
-            os.chmod(d, 0o755)
+            os.chmod(tmp, 0o755)
+        os.replace(tmp, d)
     ensure_global_exclude(dst)
     return dst
 

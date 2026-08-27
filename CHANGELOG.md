@@ -8,6 +8,41 @@ The release workflow extracts the matching `## [x.y.z]` section of this file
 as the GitHub Release body, so keep each release's notes complete and
 self-contained.
 
+## [0.3.1] - 2026-08-27
+
+### Fixed
+
+- **`rsyncronizer update` could corrupt itself mid-update.** Updating the CLI
+  from 0.2.0 to 0.3.0 on Linux ended with
+
+  ```
+  updated to 0.3.0 (user state untouched)
+  ~/.local/bin/rsyncronizer: line 296: syntax error near unexpected token `('
+  ```
+
+  `install-cli.sh` replaced files with `cp`, which truncates and rewrites the
+  *same* inode — and `update` runs that installer from inside the very script
+  it is replacing. bash reads a script incrementally from a byte offset, so
+  when execution resumed it landed inside the *new* file's bytes, mid-`case`.
+  The CLI grew from 284 to 373 lines in 0.3.0, which is what moved the offset
+  somewhere invalid.
+
+  Installs now write beside the target and `mv` it into place. rename(2) gives
+  the new content a new inode, so anything already reading the old one keeps a
+  complete, consistent copy. **The update that reports the error still
+  succeeded** — the installed 0.3.0 was intact, and running the command again
+  worked. Updating *to* 0.3.1 is clean from either 0.2.0 or 0.3.0, because the
+  installer that runs comes from the downloaded release.
+
+- The desktop app's `materialize()` had the same flaw, and it runs on **every**
+  launch: opening the app while a backup was running could have swapped
+  `lib/common.sh` underneath it. It now renames too.
+
+- The test suite built its fake update release from byte-identical files, so
+  the resumed offset always landed in identical content and the bug was
+  invisible. It now installs a different-sized replacement and asserts
+  directly that installing replaces by rename rather than in place.
+
 ## [0.3.0] - 2026-08-27
 
 ### Cloud destinations
